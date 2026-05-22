@@ -9,16 +9,20 @@ please cite it if you use this code or the architectures in your work:
 > *IEEE Journal of Biomedical and Health Informatics*, vol. 30, no. 1, Jan. 2026.
 > DOI: [10.1109/JBHI.2025.3587961](https://doi.org/10.1109/JBHI.2025.3587961)
 
-Two C variants are provided:
+Three C variants are provided:
 
-| Variant | Directory | Memory strategy | Use case |
-|---------|-----------|----------------|----------|
-| **Dynamic** | `c_port/` | `malloc` / `free` – heap allocated | Rapid prototyping, host machines |
-| **Static** | `static_port/` | Static global pools, no heap | CGRA / embedded targets, no OS |
+| Variant | Directory | Memory strategy | Data type | Use case |
+|---------|-----------|----------------|-----------|----------|
+| **Dynamic** | `c_port/` | `malloc` / `free` – heap allocated | `float` | Rapid prototyping, host machines |
+| **Static** | `static_port/` | Static global pools, no heap | `float` | embedded targets, no OS |
+| **X-HEEP / int32** | `deepbindi_cnn_x_heep/` | Static global pools, no heap | `int32_t` | X-HEEP RISC-V SoC |
 
-Both variants are **self-contained** (no dependencies beyond `libc` and `libm`),
+The dynamic and static variants are **self-contained** (no dependencies beyond `libc` and `libm`),
 produce **identical checksums**, and use the same tensor layout, layer
-primitives, and CGRA-annotated compute loops.
+primitives, and compute loops.
+
+The X-HEEP variant targets CNN_1D_v2 (PYE) only, uses **32-bit integer arithmetic throughout**
+(no `float`, no `math.h`), and is built to run bare-metal on X-HEEP with or without the FPU.
 
 ---
 
@@ -94,27 +98,32 @@ primitive handles both 1-D and 2-D cases uniformly.
 
 ```
 model/
-├── cnn_models.py           Original Python model definitions (PyTorch + Keras)
+├── cnn_models.py                   Original Python model definitions (PyTorch + Keras)
 │
-├── c_port/                 ── Dynamic variant ──────────────────────────────────
-│   ├── deepbindi_config.h  Logging + fatal-error macros (embedded portability)
-│   ├── nn_runtime.h        Tensor types, layer structs, all prototypes
-│   ├── nn_runtime.c        Scalar kernels using malloc/free
-│   ├── cnn_models_c.h      Public declarations for all 10 run_*() functions
-│   ├── cnn_models_c.c      Model forward passes (layer stacking + data flow)
-│   ├── main.c              Demo driver: runs all models, prints checksums
-│   └── Makefile            Builds deepbindi_c_demo; `make debug` enables output
+├── c_port/                         ── Dynamic variant (float, all 10 models) ───────────
+│   ├── deepbindi_config.h          Logging + fatal-error macros
+│   ├── nn_runtime.h/c              Scalar float kernels using malloc/free
+│   ├── cnn_models_c.h/c            All 10 model forward passes
+│   ├── main.c                      Demo driver: runs all models, prints checksums
+│   └── Makefile                    Builds deepbindi_c_demo
 │
-└── static_port/            ── Static variant ───────────────────────────────────
-    ├── deepbindi_config.h  Logging + fatal-error macros (embedded portability)
-    ├── arena.h             Pool size defines + bump-allocator prototypes
-    ├── arena.c             Global arrays g_weight_pool / g_act_arena + allocators
-    ├── nn_runtime.h        Same API as c_port (tensor_create → act_alloc)
-    ├── nn_runtime.c        Same kernels; tensor_free / layer_free are no-ops
-    ├── cnn_models_c.h      Same as c_port (unchanged)
-    ├── cnn_models_c.c      Same models; each run_*() starts with act_arena_reset()
-    ├── main.c              Driver; calls arena_stats() after all models
-    └── Makefile            Builds deepbindi_static_demo; `make debug` / `make verify`
+├── static_port/                    ── Static variant (float, all 10 models) ────────────
+│   ├── deepbindi_config.h          Logging + fatal-error macros
+│   ├── arena.h/c                   g_weight_pool / g_act_arena bump allocators
+│   ├── nn_runtime.h/c              Same kernels; tensor_free / layer_free are no-ops
+│   ├── cnn_models_c.h/c            Same models; act_arena_reset() between runs
+│   ├── main.c                      Driver; calls arena_stats() after all models
+│   └── Makefile                    Builds deepbindi_static_demo
+│
+└── deepbindi_cnn_x_heep/           ── X-HEEP / int32 variant (CNN_1D_v2 only) ─────────
+    ├── deepbindi_config.h          TARGET_PC stubs + DEEPBINDI_ENABLE_FPU guard
+    ├── arena.h/c                   int32_t pools (WEIGHT_POOL_WORDS / ACT_ARENA_WORDS)
+    ├── nn_runtime.h/c              int32_t kernels; no float, no math.h
+    ├── cnn_models_c.h/c            CNN_1D_v2 only; accepts real or dummy int32 input
+    ├── main.c                      X-HEEP driver (CSR cycle count, FPU optional)
+    ├── test_input.h                570 int32_t values from test_data.txt, sample 0
+    ├── Makefile                    PC build: `make run` (gcc -DTARGET_PC)
+    └── extract_weights.py          TFLite model inspector + C int32_t header generator
 ```
 
 ---
@@ -195,13 +204,15 @@ Override for your target by defining `DEEPBINDI_FATAL` before the build:
 
 ### Other portability notes
 
-| Issue | Status |
-|-------|--------|
-| `int` width | All shape fields are plain `int`. On 16-bit MCUs (AVR, MSP430) `int` is 16-bit; tensor sizes for the larger 2-D models exceed 32 767. Use a 32-bit toolchain or change shape fields to `int32_t`. |
-| `float` vs `double` | All arithmetic is `float`. No implicit promotion to `double` in the compute kernels. |
-| `memset` to zero for `float` | Relies on IEEE-754 (all-zero bits = 0.0f). Safe on all Cortex-M, RISC-V, and x86 targets in common use. |
-| `%zu` format specifier | Not supported by newlib-nano. `arena_stats()` uses `(unsigned)` casts + `%u` instead. |
-| `stdio.h` / `stdlib.h` | Only included (transitively via `deepbindi_config.h`) when `DEEPBINDI_ENABLE_LOGGING` is defined. |
+| Issue | `c_port/` / `static_port/` | `deepbindi_cnn_x_heep/` |
+|-------|---------------------------|-------------------------|
+| `int` width | Shape fields are plain `int`; 16-bit MCUs may overflow on large 2-D tensors. Use a 32-bit toolchain. | Same. |
+| Arithmetic type | `float` throughout; no implicit `double` promotion. | `int32_t` throughout; no `float`, no `math.h`. |
+| `memset` to zero | Relies on IEEE-754 all-zero = 0.0f. Safe on all common targets. | Uses explicit scalar zero-fill loops; no libc dependency. |
+| `%f` format specifier | Not used (newlib-nano limitation). Values printed as scaled integers. | Not used; values are integers, printed with `%d` directly. |
+| `%zu` format specifier | Not supported by newlib-nano; `%u` with `(unsigned)` cast used instead. | Same. |
+| `stdio.h` / `stdlib.h` | Included only when `DEEPBINDI_ENABLE_LOGGING` is defined. | Always included (logging always on); `stdlib.h` included only with `TARGET_PC`. |
+| FPU | Not required; no CSR writes. | Not required for int32 port. Guard with `#ifdef DEEPBINDI_ENABLE_FPU` if adding FP code. |
 
 ---
 
@@ -249,6 +260,164 @@ representation uniformly, so all convolutions go through `conv2d_forward`.
 **MobileNetV3 channel scaling**: `width_mult = 0.35` is applied to every
 channel count with a `make_divisible(..., 8)` rounding step (matching
 torchvision) to keep memory accesses aligned.
+
+---
+
+## X-HEEP deployment variant (`deepbindi_cnn_x_heep/`)
+
+This directory contains a dedicated port of **CNN_1D_v2 (PYE)** for the
+[X-HEEP](https://github.com/esl-epfl/x-heep) RISC-V SoC, targeting
+bare-metal inference with or without a hardware FPU
+
+### Why a separate variant?
+
+| Constraint | Source | Implication for C code |
+|------------|--------|------------------------|
+| 32-bit word length | HW accelerator requirement | `int32_t` throughout; no `int8_t` TFLite quantization |
+| No FPU guarantee | X-HEEP bare-metal startup | No `float`; no `math.h` (`expf`, `sqrtf`, `fabsf` banned) |
+| No heap allocator | Bare-metal, no OS | Static global pools; `malloc`/`free` banned |
+| No `memset` / `memcpy` | Avoid libc symbol dependencies | Explicit scalar loops everywhere |
+| No `%f` in `printf` | newlib-nano limitation | Integer printing only |
+| CSR cycle counter | X-HEEP hardware performance measurement | `CSR_WRITE/READ(CSR_REG_MCYCLE, ...)` |
+
+### Key design changes vs `static_port/`
+
+**All arithmetic is `int32_t`** — no `float` anywhere in the data path:
+
+```c
+typedef struct {
+    int      n, c, h, w;
+    int32_t *data;          /* was float * */
+} Tensor;
+```
+
+**BatchNorm is pre-folded to Q7 scale + offset** — eliminates `sqrtf` from the
+forward pass entirely:
+
+```c
+typedef struct {
+    int      num_features;
+    int32_t *scale;   /* Q7: scale[c] = round(gamma[c]/sqrt(var[c]+eps) * 128) */
+    int32_t *offset;  /* offset[c] = round(beta[c] - gamma[c]*mean[c]/sqrt(var[c]+eps)) */
+} BatchNormLayer;
+
+/* Forward: */
+y = (int32_t)(((int64_t)x * scale[c]) >> 7) + offset[c];
+```
+
+**Sigmoid replaced by a sign threshold** — the output layer is binary (fear / no fear),
+so `sigmoid(x) > 0.5` is equivalent to `x > 0`, which requires no `expf`:
+
+```c
+void sigmoid_inplace(Tensor *input) {
+    for (i = 0; i < total; ++i)
+        input->data[i] = (input->data[i] > 0) ? 1 : 0;
+}
+```
+
+**FPU enable is optional** — the int32 port does not trigger any FP instruction,
+so the `mstatus.FS` write is guarded:
+
+```c
+#ifdef DEEPBINDI_ENABLE_FPU
+    CSR_SET_BITS(CSR_REG_MSTATUS, (FS_INITIAL << 13));
+#endif
+```
+
+**PC testing** — build with a standard host `gcc` using `-DTARGET_PC` (which
+the `Makefile` sets automatically). This stubs all CSR macros and redirects
+`DEEPBINDI_FATAL` to `exit(1)`:
+
+```bash
+cd deepbindi_cnn_x_heep
+make run
+```
+
+Expected output (dummy weights, test sample 0):
+```
+DeepBindi CNN_1D_v2 on X-HEEP
+int32 inference, test sample 0 (label=0)
+Output : 1 (FEAR)
+Cycles : 0
+-- Arena usage --
+  Weight pool : 19713 / 24000 words  (77 / 93 KB)
+  Act arena   : 1211 / 2048 words  (4 / 8 KB)
+  Tensor pool : 7 / 16 structs
+-----------------
+```
+Note: with dummy (seeded pseudo-random) weights the output is meaningless — `FEAR`
+here does not indicate a real prediction. The arena numbers are the meaningful
+check: weight pool usage (19 713/24 000) and act arena (1 211/2 048) must match
+these values exactly for any correct build.
+
+### Static SRAM footprint (CNN_1D_v2, int32_t)
+
+| Buffer | Elements | Size |
+|--------|----------|------|
+| `g_weight_pool[]` | 24 000 × 4 B | 93.75 KB (move to flash for production) |
+| `g_act_arena[]` | 2 048 × 4 B | 8.00 KB |
+| `g_tensor_pool[]` | 16 structs | 0.38 KB |
+| **Total** | | **~102 KB** |
+
+Of the 93.75 KB weight pool, 19 713 words (77 KB) are actually used by CNN_1D_v2
+with dummy weights. Once trained weights are loaded as `const int32_t` arrays
+in flash (`.rodata`), the weight pool can be eliminated and SRAM drops to ~8 KB.
+
+### Overflow analysis
+
+| Layer | Max accumulator value | Headroom |
+|-------|----------------------|----------|
+| Conv1: 57×5 MACs, inputs ≤ 127, weights ≤ 8 | 285 × 127 × 8 ≈ 290 K | INT32_MAX = 2.1 G ✓ |
+| Conv2: 32×5 MACs, inputs ≤ 290 K, weights ≤ 8 | 160 × 290 K × 8 ≈ 371 M | INT32_MAX = 2.1 G ✓ |
+| BN multiply (int64 intermediate): 371 M × 128 ≈ 47 G | handled by `int64_t` cast | ✓ |
+| Dense: 64 MACs, inputs ≤ 371 M, weights ≤ 8 | 64 × 371 M × 8 ≈ 190 G | handled at INT32 post-BN clamp |
+
+In practice, pseudo-random dummy weights cancel out; worst-case values are achieved
+only when all weights and inputs have the same sign.
+
+### Test data
+
+`test_input.h` contains sample 0 from
+`CH07_TFLite/saved_model/micro/test_data.txt` (label = 0, NO_FEAR):
+
+```c
+static const int32_t test_input_0[570] = { 7, 8, 13, 10, ... };
+```
+
+Layout: `data[ch * 10 + t]` for channel `ch` ∈ [0, 56], time step `t` ∈ [0, 9].
+Values are original int8-range integers widened to `int32_t`.
+
+### Important: TFLite model vs CNN_1D_v2 architecture mismatch
+
+The `.tflite` files in `CH07_TFLite/saved_model/tflite/` are trained weights for
+`CNN_2d_tensorflow_softmax` (TF3 / `model_quant_1FC.tflite`), **not** for the
+PyTorch CNN_1D_v2 (PYE) that this C port implements:
+
+| | CNN_1D_v2 (this C port) | TFLite micro (model_quant_1FC) |
+|---|---|---|
+| Input layout | NCHW `(1, 57, 1, 10)` | NHWC `(1, 57, 10, 1)` |
+| Conv blocks | 2 — channels 57→32→64 | 1 — filters 1→64 |
+| Kernel | `(1×5)` × 2 | `(1×5)` × 1 |
+| Flatten features | 64 | 57 × 3 × 64 = 10 944 |
+| Output | 1 × threshold(0) | 2-class softmax + argmax |
+
+Consequently the `.tflite` weights **cannot be loaded directly into the C port**.
+Use `extract_weights.py` to inspect the TFLite model structure and quantization
+parameters. To load real weights into the C port, export the PyTorch CNN_1D_v2
+checkpoint instead (see *Replacing dummy weights* below).
+
+### Building for X-HEEP (CMake)
+
+Add the application to the X-HEEP build system and build as usual:
+
+```bash
+cmake -DAPP=deepbindi_cnn_x_heep [other X-HEEP flags] ..
+make
+```
+
+The application directory (`deepbindi_cnn_x_heep/`) is self-contained and
+follows the same conventions as other X-HEEP example applications
+(`example_matadd`, `example_matfloat`, etc.).
 
 ---
 
@@ -387,15 +556,53 @@ validation, compare element-wise with a tolerance of `1e-4`.
 
 ## Replacing dummy weights with real trained weights
 
-1. Export PyTorch weights to a flat binary (e.g. `torch.save` + a custom
-   extraction script, or ONNX export + `onnx` Python package).
+### `c_port/` and `static_port/` (float)
+
+1. Export PyTorch weights to a flat binary (`torch.save` + a custom extraction
+   script, or ONNX export + `onnx` Python package).
 2. Replace the `*_layer_create()` calls in `cnn_models_c.c` with a loader that
    fills pre-allocated `float` arrays from the binary file.
 3. For the **static** variant, pre-populate `g_weight_pool[]` at link time using
-   a generated C header (`weights_cnn_1d_v1.h`) with the trained values as a
-   `static const float` array, then memcpy into the pool during initialisation.
+   a generated C header (`weights_cnn_1d_v2.h`) with trained values as a
+   `static const float` array.
 4. Verify correctness by comparing `tensor_checksum` against a Python reference
    forward pass on the same input values.
+
+### `deepbindi_cnn_x_heep/` (int32)
+
+The quantized `.tflite` models in `CH07_TFLite/saved_model/tflite/` are for a
+**different architecture** (see architecture mismatch note above). To load real
+weights into the CNN_1D_v2 C port:
+
+1. **Option A — PyTorch export (recommended):** Load the trained PyTorch
+   `CNN_1D_v2` checkpoint, iterate over `model.state_dict()`, quantize each
+   weight tensor to int8 range (multiply by a per-layer scale, round, clamp to
+   ±127), and write a `weights_cnn_1d_v2.h` header with `const int32_t` arrays.
+
+2. **Option B — TFLite inspection only:** Run `extract_weights.py` to inspect the
+   TFLite model and understand its quantization parameters. These weights are not
+   directly usable in the C port but are helpful for comparison and cross-validation.
+
+   ```bash
+   python deepbindi_cnn_x_heep/extract_weights.py --inspect
+   python deepbindi_cnn_x_heep/extract_weights.py  # writes weights_tflite_1FC.h
+   ```
+
+3. Once `weights_cnn_1d_v2.h` exists, in `nn_runtime.c` replace the
+   `seeded_value_int32()` loops with reads from the const arrays:
+   ```c
+   /* in conv2d_layer_create: */
+   for (i = 0; i < weight_count; ++i)
+       layer.weights[i] = cnn1d_conv1_weights[i];
+   ```
+   The linker places `const` arrays in `.rodata` (flash), reducing SRAM from
+   ~94 KB to ~8 KB (activations only).
+
+4. Pre-fold trained BN parameters into Q7 scale+offset:
+   ```python
+   scale_int  = np.round(gamma / np.sqrt(var + eps) * 128).astype(np.int32)
+   offset_int = np.round(beta - gamma * mean / np.sqrt(var + eps)).astype(np.int32)
+   ```
 
 ---
 
@@ -420,4 +627,4 @@ If you use these models or this C port in your work, please cite the original pa
 
 L. Gutiérrez-Martín, C. López-Ongil, and J. A. Miranda-Calero, "DeepBindi: An End-to-End Fear Detection System Optimized for Extreme-Edge Deployment," *IEEE Journal of Biomedical and Health Informatics*, vol. 30, no. 1, Jan. 2026, doi: 10.1109/JBHI.2025.3587961.
 
-**Context:** The paper presents a fear-recognition system based on physiological signals (BVP, SKT, GSR) from the WEMAC dataset, achieving 80% F1-score and 74% accuracy. The system was validated on an ultra-low-power ARM Cortex-M4 (16 mW @ 5 V, 496 ms per inference). The C port in this repository implements the same model architectures to support CGRA-accelerated deployment on similar extreme-edge targets.
+**Context:** The paper presents a fear-recognition system based on physiological signals (BVP, SKT, GSR) from the WEMAC dataset, achieving 80% F1-score and 74% accuracy. The system was validated on an ultra-low-power ARM Cortex-M4 (16 mW @ 5 V, 496 ms per inference). The C port in this repository implements the same model architectures to support deployment on similar extreme-edge targets.
