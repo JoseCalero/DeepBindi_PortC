@@ -51,9 +51,14 @@
  * add floating-point operations. */
 #define FS_INITIAL 0x01
 
-/* PRINTF macro -- active on FPGA; conditionally silent in simulation. */
+/* PRINTF macro -- active on FPGA and simulation unless overridden. */
+#ifndef PRINTF_IN_FPGA
 #define PRINTF_IN_FPGA  1
-#define PRINTF_IN_SIM   0
+#endif
+
+#ifndef PRINTF_IN_SIM
+#define PRINTF_IN_SIM   1
+#endif
 
 #if defined(TARGET_PC)
     #define PRINTF(fmt, ...)    printf(fmt, ## __VA_ARGS__)
@@ -97,6 +102,7 @@ int main(void)
            out->data[0] ? "FEAR" : "NO_FEAR");
     PRINTF("Cycles : %u\r\n", cycles);
 
+#ifndef DEEPBINDI_SINGLE_SAMPLE
     /* ---- Sample 1: FEAR (expected label = %d) -------------------------- */
 
     CSR_WRITE(CSR_REG_MCYCLE, 0);
@@ -110,6 +116,7 @@ int main(void)
            (int)out->data[0],
            out->data[0] ? "FEAR" : "NO_FEAR");
     PRINTF("Cycles : %u\r\n", cycles);
+#endif
 
     /* ---- Arena stats --------------------------------------------------- */
 

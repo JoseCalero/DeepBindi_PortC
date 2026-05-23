@@ -48,8 +48,6 @@ Trained on WEMAC (wemac_50Overlapping.csv), 10-fold CV:
 | `extract_test_inputs.py` | Extract WEMAC samples and write `test_input.h` |
 | `Makefile` | PC build (dummy and real-weights targets) |
 
-Python training scripts (in `EPFL_STAY_LAURA/python_code/simulations/`):
-- `train_cnn1d_v2_xheep.py` -- standalone PyTorch training, produces `.pth` checkpoints
 
 ---
 
@@ -103,7 +101,7 @@ Output : 0 (NO_FEAR)
 --- Sample 1 (expected label=1 / FEAR) ---
 Output : 1 (FEAR)
 -- Arena usage --
-  Weight pool : 0 / 24000 words  (0 / 93 KB)
+  Weight pool : 0 / 1 words  (0 / 0 KB)
   Act arena   : 1211 / 2048 words  (4 / 8 KB)
   Tensor pool : 7 / 16 structs
 ```
@@ -129,77 +127,6 @@ gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_REAL_WEIGHTS \
     main_real.o nn_runtime_real.o cnn_models_c_real.o arena_real.o
 ./deepbindi_cnn_pc_real.exe
 ```
-
----
-
-## Training
-
-The model is trained with a standalone PyTorch script that avoids TensorFlow/Keras:
-
-```bash
-cd EPFL_STAY_LAURA/python_code/simulations/
-python train_cnn1d_v2_xheep.py
-```
-
-Output directory: `results/deepBindi/cnn1d_v2_xheep/`
-- `type4_fold0.pth` ... `type4_fold9.pth` -- per-fold checkpoints
-- `best_model.pth` -- fold with highest test F1
-- `fold_metrics.csv` -- per-fold summary
-- `training_log.txt` -- epoch-level log
-
-**Prerequisite** (Windows): `src/deep` must be a junction pointing to `src/CH07_DeepLearning`:
-```cmd
-cd EPFL_STAY_LAURA\python_code\src
-mklink /j deep CH07_DeepLearning
-```
-The old `python-deep 0.10` package (if installed) must be removed:
-```bash
-pip uninstall deep -y
-```
-
----
-
-## Weight export
-
-`export_pytorch_weights.py` performs:
-
-1. Per-tensor symmetric int8 quantization of Conv/Dense weights:
-   ```
-   scale_f  = max(|w|) / 127
-   w_int    = round(w / scale_f)     # in [-127, 127]
-   ```
-
-2. BatchNorm pre-folding to Q7 scale/offset (avoids per-inference sqrt):
-   ```
-   scale[c]  = round(gamma[c] / sqrt(var[c] + eps) * 128)   # Q7: 128 = 1.0
-   offset[c] = round(beta[c]  - gamma[c] * mean[c] / sqrt(var[c] + eps))
-   ```
-
-Observed ranges for fold-0 checkpoint:
-- BN1 scale: 245 -- 377
-- BN2 scale: 184 -- 334
-
----
-
-## Test input format
-
-`extract_test_inputs.py` selects the most confidently classified NO_FEAR and FEAR
-samples from fold 0's test set and writes them to `test_input.h`.
-
-Input quantization:
-```
-x_int32 = round(x_float * 12).clip(-128, 127)
-```
-
-The scale factor 12 maps z-score normalized WEMAC features (~[-10, 10]) into int8
-range (~[-120, 120]), consistent with the overflow analysis below.
-
-Float-model confidence for the selected fold-0 samples:
-- Sample 0 (NO_FEAR): sigmoid = 0.0313  (well below 0.5)
-- Sample 1 (FEAR):    sigmoid = 0.9987  (well above 0.5)
-
-After quantization the float model gives 0.0314 and 0.9987 respectively --
-quantization error is negligible for these high-confidence samples.
 
 ---
 
@@ -234,28 +161,88 @@ The dummy path uses scale=128 (identity BN) and tiny weights -- no overflow.
 
 | Region | Size | Usage |
 |--------|------|-------|
-| Weight pool | 24000 words (93 KB) | 19713 words in dummy build; 0 in real (ROM) |
+| Weight pool | 24000 words (93 KB) in dummy build; 1 word in real-weight build | 19713 words in dummy build; 0 in real-weight build |
 | Activation arena | 2048 words (8 KB) | 1211 words peak |
 | Tensor pool | 16 structs | 7 structs peak |
-| `weights_cnn_1d_v2.h` | 19713 int32_t (77 KB) | Compiled into .rodata / flash |
+| `weights_cnn_1d_v2.h` | 19713 int32_t (77 KB) | Compiled as const `.rodata` |
 
 ---
 
-## X-HEEP integration
+## X-HEEP / Verilator integration
 
-Add this directory as an X-HEEP application and build via the CMake flow:
 
-```cmake
-target_compile_definitions(deepbindi PRIVATE TARGET_XHEEP DEEPBINDI_REAL_WEIGHTS)
+### Current GR-HEEP on-chip simulation setup
+
+The real-weight Verilator run was validated with `LINKER=on_chip`. The GR-HEEP
+`mcu-gen-config.py` memory subsystem was expanded to:
+
+```
+Continuous SRAM : 10 x 32 KiB = 320 KiB
+Interleaved SRAM:  4 x 16 KiB =  64 KiB
+Total on-chip   :              384 KiB
+
+Linker sections:
+  code : 0x00000000 .. 0x00010000  (64 KiB)
+  data : 0x00010000 .. end of continuous SRAM
 ```
 
-Remove the `-DTARGET_PC` define; the CSR macros in `deepbindi_config.h` will
-resolve to the real X-HEEP CSR access macros.
+The application does not currently place anything in the interleaved section:
 
-CGRA acceleration targets (see comments in `nn_runtime.c`):
-- **PRIMARY**: `conv2d_forward()` -- innermost `(kh, kw)` MAC loops
-- **SECONDARY**: `dense_forward()` -- dot-product over `in_features`
-- **FUSIBLE**: `batchnorm_forward_inplace()` -- fuse with conv output stage
+```
+ILdata: 0.0 KiB used
+```
+
+The interleaved banks are generated and available to the SoC, but this scalar C
+application uses the normal continuous `code` and `data` linker sections unless
+objects are explicitly assigned to the interleaved linker section.
+
+Working build command from the GR-HEEP repository:
+
+```bash
+make app PROJECT=deepbindi_cnn_x_heep \
+  COMPILER_FLAGS='-DDEEPBINDI_REAL_WEIGHTS -DDEEPBINDI_TRACE_LAYERS' \
+  LINKER=on_chip
+
+make verilator-run
+```
+
+Validated Verilator output:
+
+```
+Simulation finished after 7050502 clock cycles
+Program Finished with value 0
+
+Output : 0 (NO_FEAR)
+Cycles : 3448985
+
+Output : 1 (FEAR)
+Cycles : 3448187
+
+-- Arena usage --
+  Weight pool : 0 / 1 words  (0 / 0 KB)
+  Act arena   : 1211 / 2048 words  (4 / 8 KB)
+  Tensor pool : 7 / 16 structs
+-----------------
+```
+
+### Program flow
+
+1. `main()` initializes optional hardware state and the cycle counter.
+2. For each test sample, `main()` calls `run_cnn_1d_v2(test_input_N)`.
+3. `run_cnn_1d_v2()` resets the activation arena and tensor descriptor pool.
+4. The input tensor is allocated from `g_act_arena`.
+5. In `DEEPBINDI_REAL_WEIGHTS` mode, layer descriptors point directly to the
+   const arrays in `weights_cnn_1d_v2.h`; the weight pool is not used.
+6. The forward pass runs:
+   `Conv1 -> BN1 -> ReLU -> shift -> Pool1 -> Conv2 -> BN2 -> ReLU -> shift -> Pool2 -> Flatten -> Dense -> threshold`.
+7. Each intermediate tensor allocation is a bump allocation from `g_act_arena`.
+   `tensor_free()` is intentionally a no-op; all temporary activation storage is
+   reclaimed together by `act_arena_reset()` at the next inference.
+8. `arena_stats()` prints high-water marks for the weight pool, activation arena,
+   and tensor descriptor pool.
+
+The "arena" is therefore a deterministic replacement for `malloc/free`: it keeps
+all inference memory static, bounded, and easy to size for FPGA/ASIC simulation.
 
 ---
 
@@ -267,3 +254,10 @@ output = (x > 0) ? 1 : 0
 ```
 Valid for the single-output binary head of CNN_1D_v2 -- the sign of the
 pre-sigmoid value determines the class. Avoids `expf()` entirely.
+
+---
+
+## CGRA acceleration targets (see comments in `nn_runtime.c`):
+- **PRIMARY**: `conv2d_forward()` -- innermost `(kh, kw)` MAC loops
+- **SECONDARY**: `dense_forward()` -- dot-product over `in_features`
+- **FUSIBLE**: `batchnorm_forward_inplace()` -- fuse with conv output stage

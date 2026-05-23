@@ -55,7 +55,11 @@
 
 /* ---- Pool sizing ------------------------------------------------------- */
 
+#ifdef DEEPBINDI_REAL_WEIGHTS
+#define WEIGHT_POOL_WORDS   1
+#else
 #define WEIGHT_POOL_WORDS   24000
+#endif
 #define ACT_ARENA_WORDS     2048
 #define MAX_LIVE_TENSORS    16
 
