@@ -33,6 +33,12 @@
 #  define DEEPBINDI_LOG_ERROR(...)  ((void)0)
 #endif
 
+#ifdef DEEPBINDI_TRACE_LAYERS
+#  define DEEPBINDI_TRACE(...)      printf(__VA_ARGS__)
+#else
+#  define DEEPBINDI_TRACE(...)
+#endif
+
 /* Fatal: spin forever on bare metal; exit(1) on PC. */
 #ifdef TARGET_PC
 #  include <stdlib.h>
@@ -41,7 +47,7 @@
 #  endif
 #else
 #  ifndef DEEPBINDI_FATAL
-#    define DEEPBINDI_FATAL(msg)  do { for(;;){} } while(0)
+#    define DEEPBINDI_FATAL(msg)  do { printf("FATAL: %s\r\n", (msg)); for(;;){} } while(0)
 #  endif
 #endif
 

@@ -17,8 +17,6 @@
  *
  *   To build with real weights:
  *     make CFLAGS="-DTARGET_PC -DDEEPBINDI_REAL_WEIGHTS"
- *   Or in the X-HEEP CMake build, add:
- *     target_compile_definitions(deepbindi PRIVATE DEEPBINDI_REAL_WEIGHTS)
  *
  * INPUT FORMAT:
  *   Pass a pointer to 570 int32_t values to run_cnn_1d_v2().
@@ -30,6 +28,7 @@
 #include <stddef.h>
 #include "cnn_models_c.h"
 #include "arena.h"
+#include "deepbindi_config.h"
 
 /* ---- Real weights (optional) ------------------------------------------- */
 
@@ -176,8 +175,11 @@ Tensor *run_cnn_1d_v2(const int32_t *input_data) {
             conv1_weight, conv1_bias);
         BatchNormLayer bn1   = batchnorm_layer_from_params(32, bn1_scale, bn1_offset);
 
+        DEEPBINDI_TRACE("DBG: conv1 start\r\n");
         x = conv2d_forward(input, &conv1);
+        DEEPBINDI_TRACE("DBG: conv1 done\r\n");
         batchnorm_forward_inplace(x, &bn1);
+        DEEPBINDI_TRACE("DBG: bn1 done\r\n");
         relu_inplace(x);
         /* Right-shift 9 to prevent overflow in Conv2.
          * After BN1 (Q7 scale ≤ 377) activations can reach ~13.6M.
@@ -186,6 +188,7 @@ Tensor *run_cnn_1d_v2(const int32_t *input_data) {
         tensor_rshift_inplace(x, 9);
         tensor_free(input);
         pooled = maxpool2d_forward(x, 1, 2, 1, 2);
+        DEEPBINDI_TRACE("DBG: pool1 done\r\n");
         tensor_free(x);
 
         Conv2DLayer    conv2 = conv2d_layer_from_weights(
@@ -193,8 +196,11 @@ Tensor *run_cnn_1d_v2(const int32_t *input_data) {
             conv2_weight, conv2_bias);
         BatchNormLayer bn2   = batchnorm_layer_from_params(64, bn2_scale, bn2_offset);
 
+        DEEPBINDI_TRACE("DBG: conv2 start\r\n");
         x = conv2d_forward(pooled, &conv2);
+        DEEPBINDI_TRACE("DBG: conv2 done\r\n");
         batchnorm_forward_inplace(x, &bn2);
+        DEEPBINDI_TRACE("DBG: bn2 done\r\n");
         relu_inplace(x);
         /* Right-shift 14 to prevent overflow in FC1.
          * After BN2 (Q7 scale ≤ 334) activations can reach ~1.41B.
@@ -203,13 +209,17 @@ Tensor *run_cnn_1d_v2(const int32_t *input_data) {
         tensor_rshift_inplace(x, 14);
         tensor_free(pooled);
         flat = maxpool2d_forward(x, 1, 2, 1, 2);
+        DEEPBINDI_TRACE("DBG: pool2 done\r\n");
         tensor_free(x);
 
         flat = flatten_forward(flat);
+        DEEPBINDI_TRACE("DBG: flatten done\r\n");
         DenseLayer fc1 = dense_layer_from_weights(64, 1, fc1_weight, fc1_bias);
         output = dense_forward(flat, &fc1);
+        DEEPBINDI_TRACE("DBG: dense done\r\n");
         tensor_free(flat);
         sigmoid_inplace(output);
+        DEEPBINDI_TRACE("DBG: sigmoid done\r\n");
     }
 #else
     /* ============================================================

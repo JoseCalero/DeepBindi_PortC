@@ -40,7 +40,14 @@ static int32_t seeded_value_int32(int index, int seed, int range) {
 
 Tensor *tensor_create(int n, int c, int h, int w) {
     int count = n * c * h * w;
-    Tensor *tensor = &g_tensor_pool[g_tensor_top++];
+    Tensor *tensor;
+    if (g_tensor_top >= MAX_LIVE_TENSORS) {
+        DEEPBINDI_LOG_ERROR(
+            "ERROR: tensor pool exhausted (top=%d max=%d)\r\n",
+            g_tensor_top, MAX_LIVE_TENSORS);
+        DEEPBINDI_FATAL("tensor pool exhausted");
+    }
+    tensor = &g_tensor_pool[g_tensor_top++];
     tensor->n    = n;
     tensor->c    = c;
     tensor->h    = h;
@@ -267,6 +274,11 @@ Tensor *conv2d_forward(const Tensor *input, const Conv2DLayer *layer) {
     int n, oc, oh, ow, icg, kh, kw;
     Tensor *output = tensor_create(input->n, layer->out_channels, out_h, out_w);
 
+    DEEPBINDI_TRACE(
+        "DBG: conv dims n=%d ic=%d oc=%d ih=%d iw=%d oh=%d ow=%d kh=%d kw=%d\r\n",
+        input->n, layer->in_channels, layer->out_channels,
+        input->h, input->w, out_h, out_w, layer->kernel_h, layer->kernel_w);
+
     for (n = 0; n < input->n; ++n) {
         for (oc = 0; oc < layer->out_channels; ++oc) {
             int group    = oc / out_per_group;
@@ -297,6 +309,10 @@ Tensor *conv2d_forward(const Tensor *input, const Conv2DLayer *layer) {
                     output->data[tensor_index(output, n, oc, oh, ow)] = sum;
                 }
             }
+#ifdef DEEPBINDI_TRACE_CONV_CHANNELS
+            DEEPBINDI_TRACE("DBG: conv oc %d/%d done\r\n",
+                            oc + 1, layer->out_channels);
+#endif
         }
     }
     return output;
