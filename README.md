@@ -14,15 +14,42 @@ Three C variants are provided:
 | Variant | Directory | Memory strategy | Data type | Use case |
 |---------|-----------|----------------|-----------|----------|
 | **Dynamic** | `c_port/` | `malloc` / `free` – heap allocated | `float` | Rapid prototyping, host machines |
-| **Static** | `static_port/` | Static global pools, no heap | `float` | embedded targets, no OS |
+| **Static** | `static_port/` | Static global pools, no heap | `float` | Embedded targets, no OS |
 | **X-HEEP / int32** | `deepbindi_cnn_x_heep/` | Static global pools, no heap | `int32_t` | X-HEEP RISC-V SoC |
 
 The dynamic and static variants are **self-contained** (no dependencies beyond `libc` and `libm`),
-produce **identical checksums**, and use the same tensor layout, layer
-primitives, and compute loops.
+produce **identical checksums**, and use the same tensor layout, layer primitives, and compute loops.
 
-The X-HEEP variant targets CNN_1D_v2 (PYE) only, uses **32-bit integer arithmetic throughout**
-(no `float`, no `math.h`), and is built to run bare-metal on X-HEEP with or without the FPU.
+The X-HEEP variant implements **three architectures** selectable at compile time
+(`-DDEEPBINDI_MODEL=0/1/2`), uses **32-bit integer arithmetic throughout**
+(no `float`, no `math.h`), and runs bare-metal on X-HEEP with or without the FPU.
+
+| Model | `-DDEEPBINDI_MODEL` | Weights (ROM) | Act RAM | Description |
+|-------|--------------------|-----------|----|-------------|
+| CNN_1D_v2 | `0` (default) | 77 KB | 4.8 KB | Baseline: two standard 1D-conv blocks |
+| MobileCNN-1D | `1` | 19.4 KB | 6.9 KB | Depthwise-separable blocks (~4× smaller) |
+| MobileCNN-SE-1D | `2` | 21.6 KB | 7.2 KB | Depthwise-separable + SE channel attention |
+
+**CNN_1D_v2** is taken directly from the DeepBindi paper above. **MobileCNN-1D** and
+**MobileCNN-SE-1D** are new designs for this port, inspired by the MobileNetV1
+depthwise-separable factorization (Howard et al., 2017), Squeeze-and-Excitation blocks (Hu et
+al., CVPR 2018), and related lightweight CNN literature targeting IoT/embedded devices (e.g.,
+Sanjay & Ahmadinia, ICMLA 2019; Nyakuri et al., IEEE Access 2025). The 1D block structure and
+int32 quantization scheme are specific to this implementation.
+
+---
+
+## Interactive model tour
+
+A self-contained HTML tutorial walks through every layer of the three X-HEEP models:
+
+```
+deepbindi_cnn_x_heep/docs/model_tour.html
+```
+
+Open it in any browser (no server required, no internet connection needed). It covers shape
+transformations, integer arithmetic formulas, weight counts, MAC counts, and activation-arena
+usage at each inference step for CNN_1D_v2, MobileCNN-1D, and MobileCNN-SE-1D.
 
 ---
 
@@ -97,33 +124,43 @@ primitive handles both 1-D and 2-D cases uniformly.
 ## Directory structure
 
 ```
-model/
+DeepBindi_PortC/
 ├── cnn_models.py                   Original Python model definitions (PyTorch + Keras)
 │
-├── c_port/                         ── Dynamic variant (float, all 10 models) ───────────
-│   ├── deepbindi_config.h          Logging + fatal-error macros
+├── c_port/                         ── Dynamic variant (float, all 10 models) ──────────
+│   ├── deepbindi_config.h
 │   ├── nn_runtime.h/c              Scalar float kernels using malloc/free
 │   ├── cnn_models_c.h/c            All 10 model forward passes
 │   ├── main.c                      Demo driver: runs all models, prints checksums
-│   └── Makefile                    Builds deepbindi_c_demo
+│   └── Makefile
 │
-├── static_port/                    ── Static variant (float, all 10 models) ────────────
-│   ├── deepbindi_config.h          Logging + fatal-error macros
+├── static_port/                    ── Static variant (float, all 10 models) ───────────
+│   ├── deepbindi_config.h
 │   ├── arena.h/c                   g_weight_pool / g_act_arena bump allocators
-│   ├── nn_runtime.h/c              Same kernels; tensor_free / layer_free are no-ops
+│   ├── nn_runtime.h/c              Same float kernels; free/layer_free are no-ops
 │   ├── cnn_models_c.h/c            Same models; act_arena_reset() between runs
 │   ├── main.c                      Driver; calls arena_stats() after all models
-│   └── Makefile                    Builds deepbindi_static_demo
+│   └── Makefile
 │
-└── deepbindi_cnn_x_heep/           ── X-HEEP / int32 variant (CNN_1D_v2 only) ─────────
+└── deepbindi_cnn_x_heep/           ── X-HEEP / int32 variant (3 models) ──────────────
     ├── deepbindi_config.h          TARGET_PC stubs + DEEPBINDI_ENABLE_FPU guard
-    ├── arena.h/c                   int32_t pools (WEIGHT_POOL_WORDS / ACT_ARENA_WORDS)
+    ├── arena.h/c                   int32_t static pools (WEIGHT_POOL / ACT_ARENA)
     ├── nn_runtime.h/c              int32_t kernels; no float, no math.h
-    ├── cnn_models_c.h/c            CNN_1D_v2 only; accepts real or dummy int32 input
-    ├── main.c                      X-HEEP driver (CSR cycle count, FPU optional)
-    ├── test_input.h                570 int32_t values from test_data.txt, sample 0
-    ├── Makefile                    PC build: `make run` (gcc -DTARGET_PC)
-    └── extract_weights.py          TFLite model inspector + C int32_t header generator
+    │                               Includes batchnorm_rshift_inplace and
+    │                               batchnorm_rshift_perchannel for mobile models
+    ├── cnn_models_c.h/c            run_cnn_1d_v2()          MODEL=0
+    ├── mobile_models_c.h/c         run_mobilecnn_1d()       MODEL=1
+    │                               run_mobilecnn_se_1d()    MODEL=2
+    ├── main.c                      X-HEEP driver (CSR cycle count, model dispatch)
+    ├── test_input.h                Two WEMAC fold-0 samples (NO_FEAR + FEAR)
+    ├── weights_cnn_1d_v2.h         CNN_1D_v2 trained weights (19 713 int32, 77 KB)
+    ├── weights_mobile1d.h          MobileCNN-1D weights + per-channel shifts (19 KB)
+    ├── weights_mobile_se.h         MobileCNN-SE weights + SE shifts (22 KB)
+    ├── export_pytorch_weights.py   CNN_1D_v2 .pth -> weights_cnn_1d_v2.h
+    ├── export_mobile_weights.py    MobileCNN .pth -> weights_mobile*.h
+    │                               (includes data-driven int32 shift calibration)
+    ├── extract_test_inputs.py      WEMAC fold-0 samples -> test_input.h
+    └── Makefile                    6 targets: 3 models × {dummy, real-weights}
 ```
 
 ---
@@ -265,9 +302,10 @@ torchvision) to keep memory accesses aligned.
 
 ## X-HEEP deployment variant (`deepbindi_cnn_x_heep/`)
 
-This directory contains a dedicated port of **CNN_1D_v2 (PYE)** for the
-[X-HEEP](https://github.com/esl-epfl/x-heep) RISC-V SoC, targeting
-bare-metal inference with or without a hardware FPU
+This directory contains a dedicated port for the
+[X-HEEP](https://github.com/esl-epfl/x-heep) RISC-V SoC supporting three
+architectures (CNN_1D_v2, MobileCNN-1D, MobileCNN-SE-1D), targeting
+bare-metal inference with or without a hardware FPU.
 
 ### Why a separate variant?
 
@@ -350,18 +388,28 @@ here does not indicate a real prediction. The arena numbers are the meaningful
 check: weight pool usage (19 713/24 000) and act arena (1 211/2 048) must match
 these values exactly for any correct build.
 
-### Static SRAM footprint (CNN_1D_v2, int32_t)
+### Static SRAM footprint
 
-| Buffer | Elements | Size |
-|--------|----------|------|
-| `g_weight_pool[]` | 24 000 × 4 B | 93.75 KB (move to flash for production) |
-| `g_act_arena[]` | 2 048 × 4 B | 8.00 KB |
-| `g_tensor_pool[]` | 16 structs | 0.38 KB |
-| **Total** | | **~102 KB** |
+All three models share the same 2 048-word (8 KB) activation arena.
+In the **real-weights build** weights live in `.rodata` (flash); the pool is 1 word.
 
-Of the 93.75 KB weight pool, 19 713 words (77 KB) are actually used by CNN_1D_v2
-with dummy weights. Once trained weights are loaded as `const int32_t` arrays
-in flash (`.rodata`), the weight pool can be eliminated and SRAM drops to ~8 KB.
+```
+                  ROM (flash)          SRAM at inference
+  CNN_1D_v2       77 KB  weights       4.8 KB act arena
+  MobileCNN-1D    19 KB  weights       6.9 KB act arena
+  MobileCNN-SE    22 KB  weights       7.2 KB act arena
+  ─────────────────────────────────────────────────────
+  Shared pool                          8.0 KB (ACT_ARENA ceiling)
+  Tensor pool                          0.4 KB (16 × sizeof(Tensor))
+```
+
+| Buffer | Real-weights build | Dummy-weights build |
+|--------|-------------------|---------------------|
+| `g_weight_pool[]` | 1 word (4 B) — no-op | 24 000 words for CNN_1D_v2; 6 000 for mobile |
+| `g_act_arena[]` | 2 048 words (8 KB) — shared by all models | same |
+| Weights | `.rodata` in flash | BSS in `g_weight_pool[]` |
+
+Dummy builds are for PC arena profiling only and should not be flashed to X-HEEP.
 
 ### Overflow analysis
 

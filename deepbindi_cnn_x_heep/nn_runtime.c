@@ -329,6 +329,60 @@ void batchnorm_forward_inplace(Tensor *input, const BatchNormLayer *layer) {
 }
 
 /*
+ * batchnorm_rshift_inplace  --  BN + post-shift fused in a single int64_t pass.
+ *
+ * Avoids int32_t overflow when the BN output (before shifting) exceeds INT32_MAX.
+ * Applies to BN_PW1 in both mobile models where large BN scales push the
+ * intermediate above 2^31-1.
+ *
+ * Formula: y = (((int64_t)x * scale) >> 7 + offset) >> post_shift
+ */
+void batchnorm_rshift_inplace(Tensor *input, const BatchNormLayer *layer, int post_shift) {
+    int n, c, h, w;
+    for (n = 0; n < input->n; ++n) {
+        for (c = 0; c < input->c; ++c) {
+            int64_t scale  = (int64_t)layer->scale[c];
+            int64_t offset = (int64_t)layer->offset[c];
+            for (h = 0; h < input->h; ++h) {
+                for (w = 0; w < input->w; ++w) {
+                    int idx = tensor_index(input, n, c, h, w);
+                    int64_t val = (((int64_t)input->data[idx] * scale) >> 7) + offset;
+                    val >>= post_shift;
+                    input->data[idx] = (int32_t)val;
+                }
+            }
+        }
+    }
+}
+
+/*
+ * batchnorm_rshift_perchannel  --  BN + per-channel post-shift in int64_t.
+ *
+ * shifts[c] is the post-shift for channel c, calibrated so that
+ * the channel's maximum possible output fits in int32_t without
+ * destroying signal in channels with small BN scales.
+ */
+void batchnorm_rshift_perchannel(Tensor *input, const BatchNormLayer *layer,
+                                  const int32_t *shifts) {
+    int n, c, h, w;
+    for (n = 0; n < input->n; ++n) {
+        for (c = 0; c < input->c; ++c) {
+            int64_t scale  = (int64_t)layer->scale[c];
+            int64_t offset = (int64_t)layer->offset[c];
+            int     shift  = (int)shifts[c];
+            for (h = 0; h < input->h; ++h) {
+                for (w = 0; w < input->w; ++w) {
+                    int idx = tensor_index(input, n, c, h, w);
+                    int64_t val = (((int64_t)input->data[idx] * scale) >> 7) + offset;
+                    val >>= shift;
+                    input->data[idx] = (int32_t)val;
+                }
+            }
+        }
+    }
+}
+
+/*
  * maxpool2d_forward  --  sliding-window max reduction.
  * For CNN_1D_v2: kernel_h=1 (1-D pool along W only).
  */
@@ -450,5 +504,83 @@ void tensor_rshift_inplace(Tensor *input, int shift) {
     int total = tensor_numel(input);
     for (i = 0; i < total; ++i) {
         input->data[i] >>= shift;
+    }
+}
+
+/* ---- SE (Squeeze-and-Excitation) primitives ------------------------------- */
+
+/*
+ * globalavgpool_forward  --  reduce (N,C,H,W) to (N,C,1,1) by spatial mean.
+ *
+ * int64_t accumulator prevents overflow for large H*W or large values.
+ * For the MobileCNN-SE-1D use case (H=1, W=4), overflow is impossible with
+ * int32_t values, but the 64-bit path is retained for generality.
+ */
+Tensor *globalavgpool_forward(const Tensor *input) {
+    int n, c, h, iw;
+    int spatial = input->h * input->w;
+    Tensor *output = tensor_create(input->n, input->c, 1, 1);
+    for (n = 0; n < input->n; ++n) {
+        for (c = 0; c < input->c; ++c) {
+            int64_t sum = 0;
+            for (h = 0; h < input->h; ++h) {
+                for (iw = 0; iw < input->w; ++iw) {
+                    sum += (int64_t)input->data[tensor_index(input, n, c, h, iw)];
+                }
+            }
+            output->data[n * input->c + c] = (int32_t)(sum / (int64_t)spatial);
+        }
+    }
+    return output;
+}
+
+/*
+ * hardsigmoid_se_inplace  --  integer hard-sigmoid for SE channel weights.
+ *
+ * Formula: y = clip((x >> shift) + 64, 0, 128)
+ * Output range: [0, 128] where 128 == 1.0 in Q7.
+ *
+ * The shift parameter places the input x in a range such that the
+ * linear region of hard-sigmoid is meaningful.  It is calibrated by
+ * export_mobile_weights.py from the actual trained SE Dense2 output range.
+ *
+ * Example (shift=23): max(|x|) ~ 350M -> 350M >> 23 = 41 -> y in [23, 105]
+ *
+ * In the dummy path, shift=0 and values are small (< 1000) -> y near 64
+ * (all channels equally weighted at 0.5), which is a valid no-op for benchmarking.
+ */
+void hardsigmoid_se_inplace(Tensor *input, int shift) {
+    int i;
+    int total = tensor_numel(input);
+    for (i = 0; i < total; ++i) {
+        int32_t y = (input->data[i] >> shift) + 64;
+        if (y < 0)   y = 0;
+        if (y > 128) y = 128;
+        input->data[i] = y;
+    }
+}
+
+/*
+ * se_channel_scale_inplace  --  SE feature recalibration.
+ *
+ * Scales each channel c of `feat` by the Q7 excitation weight se_weights[c]:
+ *   feat[n,c,h,w] = ((int64_t)feat[n,c,h,w] * se_weights->data[c]) >> 7
+ *
+ * int64_t intermediate prevents overflow when feat values are near INT32_MAX
+ * (which can happen after large BN scales).  The >>7 undoes the Q7 scale.
+ */
+void se_channel_scale_inplace(Tensor *feat, const Tensor *se_weights) {
+    int n, c, h, iw;
+    for (n = 0; n < feat->n; ++n) {
+        for (c = 0; c < feat->c; ++c) {
+            int32_t w_q7 = se_weights->data[c]; /* Q7: 128 = 1.0 */
+            for (h = 0; h < feat->h; ++h) {
+                for (iw = 0; iw < feat->w; ++iw) {
+                    int idx = tensor_index(feat, n, c, h, iw);
+                    feat->data[idx] =
+                        (int32_t)(((int64_t)feat->data[idx] * (int64_t)w_q7) >> 7);
+                }
+            }
+        }
     }
 }

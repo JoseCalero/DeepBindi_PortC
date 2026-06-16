@@ -1,0 +1,21 @@
+# Compiled objects and executables
+*.o
+*.exe
+*.out
+
+# Build targets (x-heep variant)
+deepbindi_cnn_x_heep/deepbindi_cnn_pc
+deepbindi_cnn_x_heep/deepbindi_cnn_pc_real
+
+# Build targets (static_port)
+static_port/deepbindi_static_demo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp

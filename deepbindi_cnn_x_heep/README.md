@@ -1,269 +1,543 @@
-# deepbindi_cnn_x_heep
+# deepbindi_cnn_x_heep — int32 inference engine for X-HEEP
 
-**CNN_1D_v2 (Model 4 / PYE) -- int32 C port for X-HEEP (RISC-V)**
-
-A fully integer, heap-free, FPU-free inference engine for the DeepBindi PYE model,
-designed for deployment on the [X-HEEP](https://github.com/esl-epfl/x-heep) RISC-V SoC
-with optional STRELA CGRA acceleration.
+Fully integer, heap-free, FPU-free inference engine for three DeepBindi CNN
+architectures, designed for bare-metal deployment on the
+[X-HEEP](https://github.com/esl-epfl/x-heep) RISC-V SoC with optional STRELA
+CGRA acceleration.
 
 ---
 
-## Model
+## Interactive model tour
 
-**CNN_1D_v2** (also called PYE or Model 4 in the DeepBindi paper):
+An interactive layer-by-layer tutorial is available as a standalone HTML page:
 
 ```
-Input   : (1, 57, 1, 10)  -- 57 features x 10 time frames (WEMAC dataset)
-
-Block 1 : Conv1d(57->32, k=5, pad=1) -> BN(32) -> ReLU -> MaxPool1d(2)
-          out_w = (10 + 2 - 5)/1 + 1 = 8  -> MaxPool -> 4
-          shape: (1, 32, 1, 4)
-
-Block 2 : Conv1d(32->64, k=5, pad=1) -> BN(64) -> ReLU -> MaxPool1d(2)
-          out_w = (4 + 2 - 5)/1 + 1 = 2  -> MaxPool -> 1
-          shape: (1, 64, 1, 1)
-
-Head    : Flatten -> Dense(64->1) -> threshold(0)
-          output = 1 (FEAR) if pre-threshold value > 0, else 0 (NO_FEAR)
+docs/model_tour.html
 ```
 
-Trained on WEMAC (wemac_50Overlapping.csv), 10-fold CV:
-- Best fold (0): test F1 = 0.792
-- Mean across 10 folds: F1 = 0.745, Acc = 0.717
+Open it in any browser (no server required). For each of the three models it shows the
+shape transformation, integer arithmetic formula, weight count, MAC count, and cumulative
+activation-arena usage at every layer. Use `←` / `→` keys or the pipeline strip at the
+bottom to step through.
 
 ---
 
-## Files
+## Models
 
-| File | Purpose |
-|------|---------|
-| `main.c` | Entry point: runs 2 test samples, prints output + cycle count |
-| `nn_runtime.c/h` | Tensor, Conv2D, BatchNorm, MaxPool, Dense, activations (int32) |
-| `cnn_models_c.c/h` | `run_cnn_1d_v2()` -- full forward pass |
-| `arena.c/h` | Static bump allocators (weight pool + activation arena) |
-| `deepbindi_config.h` | Pool sizes, logging macros, CSR stubs for PC build |
-| `test_input.h` | Two WEMAC fold-0 test samples (NO_FEAR and FEAR) |
-| `weights_cnn_1d_v2.h` | Trained weights as const int32_t arrays (generated) |
-| `export_pytorch_weights.py` | Convert .pth checkpoint to `weights_cnn_1d_v2.h` |
-| `extract_test_inputs.py` | Extract WEMAC samples and write `test_input.h` |
-| `Makefile` | PC build (dummy and real-weights targets) |
+Three architectures selectable at compile time via `-DDEEPBINDI_MODEL=N`:
 
-Python training scripts (in `EPFL_STAY_LAURA/python_code/simulations/`):
-- `train_cnn1d_v2_xheep.py` -- standalone PyTorch training, produces `.pth` checkpoints
+| N | Name | C entry point | Weights (ROM) | Act RAM peak |
+|---|------|---------------|---------------|--------------|
+| 0 | CNN_1D_v2 (baseline) | `run_cnn_1d_v2()` | 77 KB | 4.8 KB |
+| 1 | MobileCNN-1D (Option A) | `run_mobilecnn_1d()` | 19.4 KB | 6.9 KB |
+| 2 | MobileCNN-SE-1D (Option B) | `run_mobilecnn_se_1d()` | 21.6 KB | 7.2 KB |
+
+All models share the same input/output convention:
+- **Input**: `(1, 57, 1, 10)` — 57 WEMAC physiological features × 10 time frames
+- **Output**: `(1, 1, 1, 1)` — `0` = NO_FEAR, `1` = FEAR (sign threshold)
+
+### Architecture provenance
+
+**CNN_1D_v2** is taken directly from the DeepBindi paper (Gutiérrez-Martín et al., IEEE JBHI 2026; see citation below).
+
+**MobileCNN-1D** and **MobileCNN-SE-1D** are original designs adapted to 1D WEMAC biosignal
+classification. They draw conceptual inspiration from the MobileNetV1 depthwise-separable
+convolution factorization (Howard et al., 2017), the Squeeze-and-Excitation block (Hu et al.,
+CVPR 2018), and lightweight CNN studies targeting resource-constrained IoT/embedded devices such
+as:
+
+- Sanjay & Ahmadinia, "MobileNet-Tiny: A Deep Neural Network-Based Real-Time Object Detection
+  for Raspberry Pi," ICMLA 2019.
+- Nyakuri et al., "Tiny-MobileNet-SE: A Hybrid Lightweight CNN Architecture for
+  Resource-Constrained IoT Devices," IEEE Access 2025.
+
+The 1D block structure (DW conv → BN → ReLU → PW conv → BN → ReLU → MaxPool) and the
+integer quantization scheme are specific to this implementation and are not direct translations
+of any of the above.
 
 ---
 
-## Quick start: PC build
+## Architecture diagrams
+
+### Model 0 — CNN_1D_v2 (baseline)
+
+```
+Input (1,57,1,10)
+      |
+      v
+ Conv2D(57->32, k=5, pad=1)                        shape -> (1,32,1,8)
+      |  BN(32) pre-folded to Q7 scale+offset
+      |  ReLU
+      v
+ MaxPool2D(k=2, s=2)                               shape -> (1,32,1,4)
+      |
+      v
+ Conv2D(32->64, k=5, pad=1)                        shape -> (1,64,1,2)
+      |  BN(64) + ReLU
+      v
+ MaxPool2D(k=2, s=2)                               shape -> (1,64,1,1)
+      |
+      v
+ Flatten                                            shape -> (1,64,1,1)
+      |
+      v
+ Dense(64->1) + threshold(x>0)                     shape -> (1,1,1,1)
+      |
+      v
+  0 (NO_FEAR)  or  1 (FEAR)
+```
+
+Parameter count: 19 713 int32 (77 KB ROM), 1 211 int32 act RAM peak.
+
+---
+
+### Model 1 — MobileCNN-1D (Option A, depthwise-separable)
+
+```
+Input (1,57,1,10)
+      |
+      v
++-- Block 1 -----------------------------------------------+
+|  DWConv(57->57, k=5, pad=1, groups=57)   shape (1,57,1,8)|
+|  BN_DW1 + ReLU + rshift(SHIFT_DW1)                       |
+|  PWConv(57->32, k=1)                     shape (1,32,1,8) |
+|  BN_PW1 + ReLU + rshift(SHIFT_PW1)                       |
+|  MaxPool(k=2,s=2)                        shape (1,32,1,4) |
++-----------------------------------------------------------+
+      |
+      v
++-- Block 2 -----------------------------------------------+
+|  DWConv(32->32, k=5, pad=1, groups=32)   shape (1,32,1,2)|
+|  BN_DW2 (per-channel rshift)                              |
+|  ReLU                                                     |
+|  PWConv(32->64, k=1)                     shape (1,64,1,2) |
+|  BN_PW2 + ReLU + rshift(SHIFT_PW2)                       |
+|  MaxPool(k=2,s=2)                        shape (1,64,1,1) |
++-----------------------------------------------------------+
+      |
+      v
+ Flatten -> Dense(64->1) -> threshold(x>0)
+      |
+      v
+  0 (NO_FEAR)  or  1 (FEAR)
+```
+
+Parameter count: 4 969 int32 (19.4 KB ROM), 1 731 int32 act RAM peak.
+~4× fewer weights than CNN_1D_v2.
+
+---
+
+### Model 2 — MobileCNN-SE-1D (Option B, depthwise-separable + SE attention)
+
+```
+Input (1,57,1,10)
+      |
+      v
++-- Block 1 -----------------------------------------------+
+|  DWConv(57->57, k=5, pad=1, groups=57)   shape (1,57,1,8)|
+|  BN_DW1 + ReLU + rshift(SHIFT_DW1)                       |
+|  PWConv(57->32, k=1)                     shape (1,32,1,8) |
+|  BN_PW1 + ReLU + rshift(SHIFT_PW1)                       |
+|  MaxPool(k=2,s=2)                        shape (1,32,1,4) |
++-------------------+---------------------------------------+
+                    |
+          +---------+----------+
+          |  SE attention block|
+          |  GlobalAvgPool     | shape (1,32,1,1)
+          |  Dense(32->8)+ReLU | shape (1, 8,1,1)
+          |  rshift(SE_SHIFT_D1)
+          |  Dense(8->32)      | shape (1,32,1,1)
+          |  HardSigmoid Q7    | y=clip((x>>SE_SHIFT_HS)+64, 0, 128)
+          +--------------------+
+                    |
+          (channel-wise scale of Block 1 output: feat[c] *= se[c]/128)
+                    |
+      +---------+---+
+      v
++-- Block 2 -----------------------------------------------+
+|  (same as Model 1 Block 2)                                |
++-----------------------------------------------------------+
+      |
+      v
+ Flatten -> Dense(64->1) -> threshold(x>0)
+      |
+      v
+  0 (NO_FEAR)  or  1 (FEAR)
+```
+
+Parameter count: 5 521 int32 (21.6 KB ROM), 1 803 int32 act RAM peak.
+SE adds 552 int32 (Dense 32→8 and 8→32) over Model 1.
+
+---
+
+## Build matrix
+
+Six build targets: three models × {dummy weights, real weights}.
+
+| Make target | Binary | Model | Weights | Purpose |
+|-------------|--------|-------|---------|---------|
+| `make` / `all` | `deepbindi_cnn_pc` | CNN_1D_v2 | dummy | arena sizing |
+| `make run-real` | `deepbindi_cnn_pc_real` | CNN_1D_v2 | real | classification test |
+| `make mobile1d` | `deepbindi_mobile1d_pc` | MobileCNN-1D | dummy | arena sizing |
+| `make mobile1d-real` | `deepbindi_mobile1d_pc_real` | MobileCNN-1D | real | classification test |
+| `make mobile_se` | `deepbindi_mobile_se_pc` | MobileCNN-SE | dummy | arena sizing |
+| `make mobile_se-real` | `deepbindi_mobile_se_pc_real` | MobileCNN-SE | real | classification test |
+
+Compile flags:
+
+```
+-DDEEPBINDI_MODEL=N           0=CNN_1D_v2  1=MobileCNN-1D  2=MobileCNN-SE-1D
+-DDEEPBINDI_REAL_WEIGHTS      load const int32_t arrays from weights_*.h
+-DTARGET_PC                   stubs CSR macros, enables exit()
+```
+
+---
+
+## Quick start (PC build)
 
 ### Prerequisites
 
-- GCC (MSYS2 UCRT64 on Windows, or native gcc on Linux/macOS)
-- Python 3.x with `torch`, `numpy` (for weight export and test-input extraction)
-- Trained checkpoint (`type4_fold0.pth`) -- see Training section below
+- GCC ≥ C99 (`/c/msys64/ucrt64/bin` on Windows MSYS2)
+- Python 3 + `torch`, `numpy` (weight export only)
+- Trained checkpoints in `results/deepBindi/<model>/type4_fold0.pth`
 
-### Build dummy-weights binary (no .pth required)
+### Dummy-weights build (no checkpoint required)
 
 ```bash
-make
-make run
+# Windows MSYS2 — set PATH and TMPDIR once:
+export PATH="/c/msys64/usr/bin:/c/msys64/ucrt64/bin:$PATH"
+export TMPDIR="/tmp"
+
+# Build all three dummy targets
+gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_MODEL=0 \
+    -o deepbindi_cnn_pc    main.c cnn_models_c.c nn_runtime.c arena.c
+gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_MODEL=1 \
+    -o deepbindi_mobile1d_pc  main.c mobile_models_c.c nn_runtime.c arena.c
+gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_MODEL=2 \
+    -o deepbindi_mobile_se_pc main.c mobile_models_c.c nn_runtime.c arena.c
 ```
 
-The dummy build uses seeded random weights for benchmarking execution flow
-and cycle counting. Classification output is not meaningful.
+### Real-weights build (CNN_1D_v2)
 
-### Build real-weights binary
+```bash
+python export_pytorch_weights.py          # writes weights_cnn_1d_v2.h
+python extract_test_inputs.py             # writes test_input.h
 
-1. Train the model (or use existing checkpoint):
-   ```
-   results/deepBindi/cnn1d_v2_xheep/type4_fold0.pth
-   ```
-
-2. Export weights to C header:
-   ```bash
-   python export_pytorch_weights.py
-   # auto-detects most recent checkpoint; writes weights_cnn_1d_v2.h
-   ```
-
-3. Extract test inputs:
-   ```bash
-   python extract_test_inputs.py
-   # writes test_input.h with two WEMAC fold-0 samples
-   ```
-
-4. Build and run:
-   ```bash
-   make run-real
-   ```
-
-**Expected output:**
+gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_MODEL=0 -DDEEPBINDI_REAL_WEIGHTS \
+    -o deepbindi_cnn_pc_real main.c cnn_models_c.c nn_runtime.c arena.c
+./deepbindi_cnn_pc_real
 ```
-DeepBindi CNN_1D_v2 on X-HEEP (int32)
+
+### Real-weights build (MobileCNN-1D and SE)
+
+```bash
+# Train (if no checkpoint exists):
+python train_mobilecnn_1d.py --model mobile1d
+python train_mobilecnn_1d.py --model mobile_se
+
+# Export weights (calibrates int32 shifts from test_input.h automatically):
+python export_mobile_weights.py --model mobile1d   # -> weights_mobile1d.h
+python export_mobile_weights.py --model mobile_se  # -> weights_mobile_se.h
+
+# Build Model 1:
+gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_MODEL=1 -DDEEPBINDI_REAL_WEIGHTS \
+    -o deepbindi_mobile1d_pc_real main.c mobile_models_c.c nn_runtime.c arena.c
+
+# Build Model 2:
+gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_MODEL=2 -DDEEPBINDI_REAL_WEIGHTS \
+    -o deepbindi_mobile_se_pc_real main.c mobile_models_c.c nn_runtime.c arena.c
+```
+
+### Expected output (all three real-weights builds)
+
+```
 --- Sample 0 (expected label=0 / NO_FEAR) ---
 Output : 0 (NO_FEAR)
 --- Sample 1 (expected label=1 / FEAR) ---
 Output : 1 (FEAR)
 -- Arena usage --
-  Weight pool : 0 / 24000 words  (0 / 93 KB)
-  Act arena   : 1211 / 2048 words  (4 / 8 KB)
-  Tensor pool : 7 / 16 structs
-```
-
-### Windows / MSYS2 note
-
-`make` cannot find gcc if the UCRT64 bin directory is not on PATH.
-Use the explicit approach:
-
-```bash
-export PATH="/c/msys64/ucrt64/bin:$PATH"
-gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -c -o main.o main.c
-# ... (see Makefile for all object files)
-gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -o deepbindi_cnn_pc \
-    main.o nn_runtime.o cnn_models_c.o arena.o
-
-# Real-weights variant:
-gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_REAL_WEIGHTS \
-    -c -o main_real.o main.c
-# ... (add -DDEEPBINDI_REAL_WEIGHTS to all object compilations)
-gcc -Wall -Wextra -O2 -std=c99 -DTARGET_PC -DDEEPBINDI_REAL_WEIGHTS \
-    -o deepbindi_cnn_pc_real \
-    main_real.o nn_runtime_real.o cnn_models_c_real.o arena_real.o
-./deepbindi_cnn_pc_real.exe
+  Weight pool : 0 / 1 words  (0 / 0 KB)      <- weights in .rodata, not pool
+  Act arena   : XXXX / 2048 words
+  Tensor pool : N / 16 structs
 ```
 
 ---
 
-## Training
+## File inventory
 
-The model is trained with a standalone PyTorch script that avoids TensorFlow/Keras:
+| File | Purpose |
+|------|---------|
+| `main.c` | Entry point: runs 2 test samples, prints output + cycle count |
+| `nn_runtime.h/c` | All tensor/layer primitives (int32, no float, no math.h) |
+| `cnn_models_c.h/c` | `run_cnn_1d_v2()` — CNN_1D_v2 forward pass |
+| `mobile_models_c.h/c` | `run_mobilecnn_1d()` and `run_mobilecnn_se_1d()` |
+| `arena.h/c` | Static bump allocators (g_weight_pool + g_act_arena) |
+| `deepbindi_config.h` | Pool sizes, logging macros, CSR stubs for PC build |
+| `test_input.h` | Two WEMAC fold-0 test samples (NO_FEAR idx=698, FEAR idx=641) |
+| `weights_cnn_1d_v2.h` | CNN_1D_v2 trained weights as const int32_t (generated) |
+| `weights_mobile1d.h` | MobileCNN-1D trained weights + per-channel shifts (generated) |
+| `weights_mobile_se.h` | MobileCNN-SE trained weights + SE shifts (generated) |
+| `export_pytorch_weights.py` | Convert CNN_1D_v2 .pth → `weights_cnn_1d_v2.h` |
+| `export_mobile_weights.py` | Convert MobileCNN .pth → `weights_mobile*.h` |
+| `extract_test_inputs.py` | Extract WEMAC samples → `test_input.h` |
+| `Makefile` | PC build — all six targets (dummy and real-weights) |
 
-```bash
-cd EPFL_STAY_LAURA/python_code/simulations/
-python train_cnn1d_v2_xheep.py
-```
-
-Output directory: `results/deepBindi/cnn1d_v2_xheep/`
-- `type4_fold0.pth` ... `type4_fold9.pth` -- per-fold checkpoints
-- `best_model.pth` -- fold with highest test F1
-- `fold_metrics.csv` -- per-fold summary
-- `training_log.txt` -- epoch-level log
-
-**Prerequisite** (Windows): `src/deep` must be a junction pointing to `src/CH07_DeepLearning`:
-```cmd
-cd EPFL_STAY_LAURA\python_code\src
-mklink /j deep CH07_DeepLearning
-```
-The old `python-deep 0.10` package (if installed) must be removed:
-```bash
-pip uninstall deep -y
-```
+Training scripts (in `EPFL_STAY_LAURA/python_code/simulations/`):
+- `train_cnn1d_v2_xheep.py` — trains CNN_1D_v2
+- `train_mobilecnn_1d.py` — trains MobileCNN-1D and MobileCNN-SE-1D (flag `--model`)
 
 ---
 
-## Weight export
+## Integer arithmetic pipeline
 
-`export_pytorch_weights.py` performs:
+All arithmetic is `int32_t`/`int64_t` throughout. No `float`, no `math.h`.
 
-1. Per-tensor symmetric int8 quantization of Conv/Dense weights:
-   ```
-   scale_f  = max(|w|) / 127
-   w_int    = round(w / scale_f)     # in [-127, 127]
-   ```
+### Input quantization
 
-2. BatchNorm pre-folding to Q7 scale/offset (avoids per-inference sqrt):
-   ```
-   scale[c]  = round(gamma[c] / sqrt(var[c] + eps) * 128)   # Q7: 128 = 1.0
-   offset[c] = round(beta[c]  - gamma[c] * mean[c] / sqrt(var[c] + eps))
-   ```
-
-Observed ranges for fold-0 checkpoint:
-- BN1 scale: 245 -- 377
-- BN2 scale: 184 -- 334
-
----
-
-## Test input format
-
-`extract_test_inputs.py` selects the most confidently classified NO_FEAR and FEAR
-samples from fold 0's test set and writes them to `test_input.h`.
-
-Input quantization:
 ```
 x_int32 = round(x_float * 12).clip(-128, 127)
 ```
 
-The scale factor 12 maps z-score normalized WEMAC features (~[-10, 10]) into int8
-range (~[-120, 120]), consistent with the overflow analysis below.
+Scale factor 12 maps z-score normalized WEMAC features (~[-10, 10]) into int8
+range (~[-120, 120]).
 
-Float-model confidence for the selected fold-0 samples:
-- Sample 0 (NO_FEAR): sigmoid = 0.0313  (well below 0.5)
-- Sample 1 (FEAR):    sigmoid = 0.9987  (well above 0.5)
+### Weight quantization (at export time, Python)
 
-After quantization the float model gives 0.0314 and 0.9987 respectively --
-quantization error is negligible for these high-confidence samples.
+```
+scale_f = max(|w_float|) / 127
+w_int   = round(w_float / scale_f)     # range [-127, 127], stored as int32_t
+```
 
----
+### BatchNorm pre-folding (at export time, Python)
 
-## Integer arithmetic and overflow
+BN is folded into two integer constants per channel, eliminating `sqrtf` and
+all per-inference floating-point:
 
-All computations use `int32_t` throughout. Potential overflow points are mitigated:
+```
+scale_q7[c]  = round(gamma[c] / sqrt(var[c] + eps) * 128)   # Q7: 128 = 1.0
+offset_q[c]  = round(beta[c]  - gamma[c] * mean[c] / sqrt(var[c] + eps))
+```
 
-### BatchNorm
-Uses `int64_t` intermediate:
+Forward pass (C):
 ```c
-y = (int32_t)(((int64_t)x * scale[c]) >> 7) + offset[c]
+/* int64_t intermediate prevents overflow before the int32_t cast */
+y = (int32_t)(((int64_t)x * scale_q7[c]) >> 7) + offset_q[c];
 ```
 
-### Post-BN right-shifts (real-weights path only)
+### Fused BN + post-shift (batchnorm_rshift_inplace)
 
-After BN1 (Q7 scale <= 377), activations can reach ~13.6M.
-Conv2 (160 MACs x 127) would accumulate 276B -- well above INT32_MAX (2.1B).
-
-Solution: `tensor_rshift_inplace()` after each BN+ReLU in the real-weights path:
+Used after every BN layer in the real-weights mobile models. Holding the
+intermediate in int64_t prevents overflow even when `scale_q7` values reach
+700+ and the accumulator is several billion:
 
 ```
-After BN1 + ReLU:  >> 9   (13.6M >> 9 ~= 26.6K;  Conv2 max ~= 540M  OK)
-After BN2 + ReLU:  >> 14  (1.41B >> 14 ~= 86K;    FC1  max ~= 699M  OK)
+y = (((int64_t)x * scale_q7[c]) >> 7 + offset_q[c]) >> post_shift
 ```
 
-These shifts are only applied in the `DEEPBINDI_REAL_WEIGHTS` path.
-The dummy path uses scale=128 (identity BN) and tiny weights -- no overflow.
+### Per-channel BN + post-shift (batchnorm_rshift_perchannel)
+
+Used specifically for BN_DW2 in both mobile models. The depthwise BN Q7 scale
+varies dramatically across channels (e.g., 308 to 1574 for MobileCNN-1D — a 5×
+span). A single global post-shift sized for the worst channel wastes up to 5
+bits of precision in all lower-scale channels:
+
+```
+y[c] = (((int64_t)x[c] * scale_q7[c]) >> 7 + offset_q[c]) >> shifts[c]
+```
+
+`shifts[c]` is stored as `mobile_bn_dw2_shift[32]` in the weights header.
+
+### Data-driven shift calibration
+
+The mobile weight export script (`export_mobile_weights.py`) calibrates the
+post-shift values in two stages:
+
+```
+Stage 1 (theoretical):  SHIFT_DW1 and SHIFT_PW1 prevent int32_t overflow
+                        in the conv accumulators.  Uses worst-case inputs.
+
+Stage 2 (data-driven):  DW2 and PW2 shifts use actual pool1 max measured
+                        by simulating Block 1 on the two test samples.
+```
+
+Why data-driven for Stage 2? The theoretical pool1 max (from 100% saturated
+int8 inputs + int8 weights) is ~1000× larger than the observed value for real
+physiological signals. Using it for DW2 calibration forces 13–16-bit right
+shifts, reducing real signal to < 50 counts — enough to collapse all downstream
+activations to zero (always FEAR).
+
+```
+Theoretical pool1 max:  ~2,638,000  (all inputs and weights at ±127)
+Observed pool1 max:     ~4,464      (actual WEMAC samples after Block 1 sim)
+Ratio:                  ~590×
+```
+
+With 8× safety margin over the observed max, DW2 per-channel shifts drop from
+[13..16] (theoretical) to [7..10] (data-driven), preserving ~64× more signal.
+
+Shift calibration flow:
+
+```
+export_mobile_weights.py
+  |
+  +-- load_test_inputs_from_header(test_input.h)
+  |       -> sample0 (57,10) int32, sample1 (57,10) int32
+  |
+  +-- simulate_block1_pool1_max(sample, weights, shifts)
+  |       -> int32 simulation of DW1+BN+ReLU+PW1+BN+ReLU+MaxPool
+  |       -> actual_pool1_max  (e.g., 4464 for mobile1d)
+  |
+  +-- compute_all_shifts(bn_scales, actual_pool1_max, safety=8)
+          -> SHIFT_DW1, SHIFT_PW1   (theoretical)
+          -> shifts_dw2[32]         (data-driven, per-channel)
+          -> SHIFT_PW2              (from calibrated V3_max)
+```
 
 ---
 
 ## Memory footprint
 
-| Region | Size | Usage |
-|--------|------|-------|
-| Weight pool | 24000 words (93 KB) | 19713 words in dummy build; 0 in real (ROM) |
-| Activation arena | 2048 words (8 KB) | 1211 words peak |
-| Tensor pool | 16 structs | 7 structs peak |
-| `weights_cnn_1d_v2.h` | 19713 int32_t (77 KB) | Compiled into .rodata / flash |
+All three models fit within the same 2 048-word (8 KB) activation arena:
+
+```
+  g_act_arena[2048]        (all int32_t)
+
+  CNN_1D_v2     |||||||||||||||||||||||||||||||||||     1211 / 2048 words (59%)
+  MobileCNN-1D  |||||||||||||||||||||||||||||||||||||||||||||  1731 / 2048 (85%)
+  MobileCNN-SE  |||||||||||||||||||||||||||||||||||||||||||||||  1803 / 2048 (88%)
+```
+
+| Region | CNN_1D_v2 | MobileCNN-1D | MobileCNN-SE |
+|--------|-----------|--------------|--------------|
+| Weights (ROM / flash) | 19 713 × 4 B = **77 KB** | 4 969 × 4 B = **19.4 KB** | 5 521 × 4 B = **21.6 KB** |
+| Act arena peak (RAM) | 1 211 × 4 B = **4.8 KB** | 1 731 × 4 B = **6.9 KB** | 1 803 × 4 B = **7.2 KB** |
+| Tensor pool structs | 7 / 16 | 9 / 16 | 12 / 16 |
+| g_weight_pool (real build) | 1 word (4 B) | 1 word (4 B) | 1 word (4 B) |
+| g_weight_pool (dummy build) | 24 000 words | 6 000 words | 6 000 words |
+
+In the real-weights build all weight constants live in `.rodata` (flash). The
+`g_weight_pool[]` shrinks to 1 word. Total on-chip SRAM needed at inference:
+**≤ 8 KB** (act arena) plus stack, regardless of model.
 
 ---
 
 ## X-HEEP integration
 
-Add this directory as an X-HEEP application and build via the CMake flow:
+### X-HEEP readiness checklist
+
+| Constraint | Status |
+|-----------|--------|
+| No `float` / `double` in data path | All arithmetic is `int32_t` / `int64_t` |
+| No `math.h` (`expf`, `sqrtf`, ...) | BN pre-folded; sigmoid → sign threshold |
+| No `malloc` / `free` / heap | All allocations from static arenas |
+| No `memset` / `memcpy` | Explicit scalar loops throughout |
+| No `%f` in `printf` | Values printed with `%d` only |
+| CSR cycle counter | `CSR_WRITE/READ(CSR_REG_MCYCLE, ...)` — stubbed by `TARGET_PC` |
+| FPU not required | No FP instruction in any code path; guarded by `DEEPBINDI_ENABLE_FPU` |
+| `exit()` bare-metal safe | `DEEPBINDI_FATAL` → `for(;;){}` (watchdog reset) |
+
+### CMake build flags for X-HEEP
 
 ```cmake
-target_compile_definitions(deepbindi PRIVATE TARGET_XHEEP DEEPBINDI_REAL_WEIGHTS)
+target_compile_definitions(deepbindi PRIVATE
+    DEEPBINDI_MODEL=1           # or 0 or 2
+    DEEPBINDI_REAL_WEIGHTS      # use .rodata const arrays
+    # no TARGET_PC
+)
 ```
 
-Remove the `-DTARGET_PC` define; the CSR macros in `deepbindi_config.h` will
-resolve to the real X-HEEP CSR access macros.
+### `make app` invocation (X-HEEP SDK)
 
-CGRA acceleration targets (see comments in `nn_runtime.c`):
-- **PRIMARY**: `conv2d_forward()` -- innermost `(kh, kw)` MAC loops
-- **SECONDARY**: `dense_forward()` -- dot-product over `in_features`
-- **FUSIBLE**: `batchnorm_forward_inplace()` -- fuse with conv output stage
+Place (or symlink) the `deepbindi_cnn_x_heep/` directory under
+`sw/applications/deepbindi_cnn_x_heep/` inside the X-HEEP repository, then:
+
+```bash
+# Minimal — CNN_1D_v2, real weights, result output only
+make app PROJECT=deepbindi_cnn_x_heep \
+         COMPILER_FLAGS='-DDEEPBINDI_MODEL=0 -DDEEPBINDI_REAL_WEIGHTS'
+
+# MobileCNN-1D with per-layer trace and arena stats enabled
+make app PROJECT=deepbindi_cnn_x_heep \
+         COMPILER_FLAGS='-DDEEPBINDI_MODEL=1 -DDEEPBINDI_REAL_WEIGHTS -DDEEPBINDI_TRACE_LAYERS'
+
+# MobileCNN-SE-1D, silent (no DEEPBINDI_TRACE_LAYERS) — result + cycles only
+make app PROJECT=deepbindi_cnn_x_heep \
+         COMPILER_FLAGS='-DDEEPBINDI_MODEL=2 -DDEEPBINDI_REAL_WEIGHTS'
+```
+
+`-DDEEPBINDI_TRACE_LAYERS` enables per-layer tensor shape/checksum prints and
+arena usage stats via `DEEPBINDI_PRINTF`. The final result (`Output: 0/1`,
+`Cycles: N`) is always printed regardless of this flag.
+
+### CGRA acceleration targets
+
+```
+conv2d_forward()                *** PRIMARY ***
+  innermost (kh, kw) MAC loops — standard CGRA MAC chain
+  depthwise variant (groups=in_channels) collapses icg loop to 1
+
+dense_forward()                 ** SECONDARY **
+  dot-product over in_features — short for these models (8–64 inputs)
+
+batchnorm_rshift_inplace()      * FUSIBLE *
+  per-channel BN + rshift — merge with conv output stage (no extra mem round-trip)
+
+batchnorm_rshift_perchannel()   * FUSIBLE *
+  same as above but with per-channel post-shift — BN_DW2 in mobile models
+```
 
 ---
 
 ## Sigmoid replacement
 
 The float sigmoid `1/(1+exp(-x))` is replaced by a hard threshold:
+
 ```c
-output = (x > 0) ? 1 : 0
+output = (x > 0) ? 1 : 0;
 ```
-Valid for the single-output binary head of CNN_1D_v2 -- the sign of the
-pre-sigmoid value determines the class. Avoids `expf()` entirely.
+
+Valid for the single-output binary head — the sign of the pre-sigmoid value
+determines the class. Avoids `expf()` entirely.
+
+## SE hard-sigmoid
+
+The SE block excitation uses an integer hard-sigmoid:
+
+```c
+/* y = clip((x >> shift) + 64, 0, 128)  where 128 = 1.0 in Q7 */
+y = (int32_t)(x >> shift) + 64;
+if (y < 0) y = 0;
+if (y > 128) y = 128;
+```
+
+`SE_SHIFT_HS` is chosen so that `max(|x|) >> SE_SHIFT_HS ≤ 64`, keeping the
+output in [0, 128].
+
+---
+
+## Test input format
+
+`extract_test_inputs.py` selects the most confidently classified NO_FEAR and
+FEAR samples from fold-0's test set:
+
+| Sample | WEMAC idx | Label | Float model sigmoid |
+|--------|-----------|-------|---------------------|
+| `test_input_0` | 698 | NO_FEAR (0) | 0.0313 |
+| `test_input_1` | 641 | FEAR (1) | 0.9987 |
+
+Layout: `data[ch * 10 + t]`, channel `ch` ∈ [0, 56], time `t` ∈ [0, 9].
+570 int32_t values per sample, quantized as `round(x_float * 12).clip(-128, 127)`.
+
+---
+
+## Citation
+
+```bibtex
+@article{gutierrez2026deepbindi,
+  author  = {Gutiérrez-Martín, Laura and López-Ongil, Celia and Miranda-Calero, Jose A.},
+  title   = {{DeepBindi}: An End-to-End Fear Detection System Optimized for Extreme-Edge Deployment},
+  journal = {IEEE Journal of Biomedical and Health Informatics},
+  volume  = {30}, number = {1}, year = {2026},
+  doi     = {10.1109/JBHI.2025.3587961}
+}
+```

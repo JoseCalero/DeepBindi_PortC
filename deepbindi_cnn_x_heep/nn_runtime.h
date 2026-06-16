@@ -150,6 +150,39 @@ Tensor *conv2d_forward(const Tensor *input, const Conv2DLayer *layer);
 /** Apply inference-mode batch norm in-place (CGRA fusion target). */
 void batchnorm_forward_inplace(Tensor *input, const BatchNormLayer *layer);
 
+/**
+ * batchnorm_rshift_inplace  --  BN + post-shift fused in a single int64 pass.
+ *
+ * Equivalent to batchnorm_forward_inplace() followed by tensor_rshift_inplace(),
+ * but avoids intermediate int32_t overflow when the raw BN output exceeds INT32_MAX.
+ *
+ * Formula: y = (((int64_t)x * scale[c]) >> 7 + offset[c]) >> post_shift
+ *
+ * The int64_t accumulator is held throughout; only the final right-shifted
+ * result is cast to int32_t.  Use this for BN layers in MobileCNN models
+ * where large BN scales (> ~300) can push the intermediate BN output above
+ * INT32_MAX before the shift -- in particular BN_PW1 of both mobile models.
+ *
+ * In CNN_1D_v2 the BN intermediate stays below INT32_MAX, so the existing
+ * two-step (batchnorm_forward_inplace + tensor_rshift_inplace) is fine there.
+ */
+void batchnorm_rshift_inplace(Tensor *input, const BatchNormLayer *layer, int post_shift);
+
+/**
+ * batchnorm_rshift_perchannel  --  BN + per-channel post-shift.
+ *
+ * Same as batchnorm_rshift_inplace() but the post-shift amount is specified
+ * per output channel via shifts[c].  This is critical for depthwise BN layers
+ * whose Q7 scale factors vary widely across channels (e.g. 308 to 1574): a
+ * global shift calibrated for the worst channel destroys signal in all others.
+ * Per-channel shifts let each channel use the minimum shift required to keep
+ * its output in int32_t range while maximising retained dynamic range.
+ *
+ * Formula: y[c] = (((int64_t)x[c] * scale[c]) >> 7 + offset[c]) >> shifts[c]
+ */
+void batchnorm_rshift_perchannel(Tensor *input, const BatchNormLayer *layer,
+                                  const int32_t *shifts);
+
 /** 2-D max pooling (no padding). */
 Tensor *maxpool2d_forward(const Tensor *input,
                            int kernel_h, int kernel_w,
@@ -178,13 +211,41 @@ void sigmoid_inplace(Tensor *input);
  *
  *   REAL-WEIGHTS overflow analysis (input in int8 range, Q7 BN scales):
  *     After BN1 (scale ≤ 377, input ≤ 128, conv1 285 MACs): max ≈ 13.6M
- *       → right-shift 9:  13.6M >> 9 ≈ 26.6K  (Conv2 max acc ≈ 540M ✓)
+ *       -> right-shift 9:  13.6M >> 9 ≈ 26.6K  (Conv2 max acc ≈ 540M OK)
  *     After BN2 (scale ≤ 334, conv2 160 MACs):  max ≈ 1.41B
- *       → right-shift 14: 1.41B >> 14 ≈ 86K    (FC1  max acc ≈ 699M ✓)
+ *       -> right-shift 14: 1.41B >> 14 ≈ 86K    (FC1  max acc ≈ 699M OK)
  *
  * In the dummy-weight path no overflow occurs (scale=128, tiny weights),
  * so this function is only called from the DEEPBINDI_REAL_WEIGHTS code path.
  */
 void tensor_rshift_inplace(Tensor *input, int shift);
+
+/* ---- SE (Squeeze-and-Excitation) primitives --------------------------------
+ *
+ * Used by MobileCNN-SE-1D (DEEPBINDI_MODEL == 2).
+ * All three functions below are available regardless of model selection;
+ * the linker discards them if not called.
+ */
+
+/**
+ * globalavgpool_forward  --  global average pooling over spatial dims H and W.
+ * Output: (N, C, 1, 1).  Uses int64_t accumulator to prevent overflow.
+ */
+Tensor *globalavgpool_forward(const Tensor *input);
+
+/**
+ * hardsigmoid_se_inplace  --  integer hard-sigmoid for SE excitation weights.
+ * Maps x -> clip((x >> shift) + 64, 0, 128)  where 128 = 1.0 in Q7.
+ * shift is calibrated at export time so max(|x|) >> shift <= 64.
+ */
+void hardsigmoid_se_inplace(Tensor *input, int shift);
+
+/**
+ * se_channel_scale_inplace  --  SE feature recalibration.
+ * For each channel c: feat[c,h,w] = ((int64_t)feat[c,h,w] * se[c]) >> 7
+ * feat:       (N, C, H, W) -- feature map
+ * se_weights: (N, C, 1, 1) -- Q7 excitation weights from hardsigmoid_se_inplace
+ */
+void se_channel_scale_inplace(Tensor *feat, const Tensor *se_weights);
 
 #endif /* NN_RUNTIME_H */

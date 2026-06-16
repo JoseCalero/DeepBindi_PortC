@@ -1,49 +1,58 @@
 /**
- * arena.h  --  Static memory pools, sized for CNN_1D_v2 (PYE) on X-HEEP.
+ * arena.h  --  Static memory pools for DeepBindi CNN inference on X-HEEP.
  *              int32_t variant: no floating-point, no math.h.
  *
  * Two global pools replace all heap allocations:
  *
- *   g_weight_pool[]  Holds weights, biases, and BatchNorm parameters for
- *                    one CNN_1D_v2 forward pass.  Allocated once at startup;
- *                    never freed.  Replace with const arrays in flash (.rodata)
- *                    once trained weights are available (see weights_cnn_1d_v2.h).
+ *   g_weight_pool[]  Dummy weights for benchmarking (seeded generation).
+ *                    Unused in real-weights build (weights live in .rodata).
  *
  *   g_act_arena[]    Scratch buffer for intermediate activation tensors.
- *                    Bump-allocated; reset by act_arena_reset() at the start of
- *                    each forward pass.  All tensor_free() calls are no-ops.
+ *                    Bump-allocated; reset by act_arena_reset() at the start
+ *                    of each forward pass.  tensor_free() is a no-op.
  *
  *   g_tensor_pool[]  Pool of Tensor descriptor structs (n,c,h,w,*data).
  *
- * Pool sizes for CNN_1D_v2 (one forward pass, 32-bit int, dummy weights):
+ * Model selection: compile with -DDEEPBINDI_MODEL=N
+ *   0 (default): CNN_1D_v2    (baseline, 19713 weight words, 1211 act words)
+ *   1:           MobileCNN-1D (DW+PW,    ~4937 weight words, 1731 act words)
+ *   2:           MobileCNN-SE (DW+PW+SE, ~5489 weight words, 1803 act words)
  *
- *   Weight pool (int32_t element counts):
- *     Conv1 weights : 57 * 32 * 1 * 5  =  9 120
- *     Conv1 bias    :              32
- *     BN1 scale+off :          2 * 32  =     64
- *     Conv2 weights : 32 * 64 * 1 * 5  = 10 240
- *     Conv2 bias    :              64
- *     BN2 scale+off :          2 * 64  =    128
- *     FC    weights :      64 * 1      =     64
- *     FC    bias    :               1
- *     Total                              19 713  -->  WEIGHT_POOL_WORDS = 24 000
+ * Weight pool (dummy build, worst-case per model):
  *
- *   Activation arena (int32_t element counts):
- *     input         :  1*57*1*10 =  570
- *     conv1 out     :  1*32*1*8  =  256   out_w = (10+2*1-5)/1+1 = 8
- *     pool1 out     :  1*32*1*4  =  128   out_w = (8-2)/2+1 = 4
- *     conv2 out     :  1*64*1*2  =  128   out_w = (4+2*1-5)/1+1 = 2
- *     pool2 out     :  1*64*1*1  =   64   out_w = (2-2)/2+1 = 1
- *     flatten       :  1*64*1*1  =   64
- *     fc out        :  1*1*1*1   =    1
- *     Total                        1 211  -->  ACT_ARENA_WORDS = 2 048
+ *   CNN_1D_v2 (MODEL 0):
+ *     Conv1(57*32*5)+bias+BN : 9120+32+64    =  9 216
+ *     Conv2(32*64*5)+bias+BN : 10240+64+128  = 10 432
+ *     FC(64)+bias             : 64+1          =     65
+ *     Total                                    19 713  --> 24 000 words
  *
- *   Tensor descriptors: 7 live  -->  MAX_LIVE_TENSORS = 16
+ *   MobileCNN-1D (MODEL 1):
+ *     DW1(57*5)+bias+BN(57)   :  285+57+114  =    456
+ *     PW1(57*32)+bias+BN(32)  : 1824+32+64   =  1 920
+ *     DW2(32*5)+bias+BN(32)   :  160+32+64   =    256
+ *     PW2(32*64)+bias+BN(64)  : 2048+64+128  =  2 240
+ *     FC(64)+bias              :   64+1       =     65
+ *     Total                                     4 937  -->  6 000 words
  *
- * Total SRAM footprint:
+ *   MobileCNN-SE-1D (MODEL 2):
+ *     Same as MODEL 1, plus:
+ *     SE_Dense1(32*8)+bias     :  256+8       =    264
+ *     SE_Dense2(8*32)+bias     :  256+32      =    288
+ *     Total                                     5 489  -->  6 000 words
+ *
+ * Activation arena (all models, int32_t elements):
+ *   CNN_1D_v2:       1211 words peak
+ *   MobileCNN-1D:    1731 words peak
+ *   MobileCNN-SE-1D: 1803 words peak
+ *   --> ACT_ARENA_WORDS = 2048  (covers all models)
+ *
+ * Tensor pool: max 12 simultaneous descriptors (MobileCNN-SE-1D)
+ *   --> MAX_LIVE_TENSORS = 16  (covers all models)
+ *
+ * Total SRAM footprint (dummy build, largest model CNN_1D_v2):
  *   Weight pool  : 24 000 * 4 B =  93.75 KB  (move to flash for production)
  *   Act arena    :  2 048 * 4 B =   8.00 KB
- *   Tensor pool  :     16 * 24 B =  0.375 KB
+ *   Tensor pool  :     16 * 24 B =  0.38 KB
  *   Total                         ~102 KB
  */
 
@@ -53,11 +62,24 @@
 #include <stdint.h>
 #include "nn_runtime.h"
 
-/* ---- Pool sizing ------------------------------------------------------- */
+/* ---- Pool sizing  (model-aware) ---------------------------------------- */
 
-#define WEIGHT_POOL_WORDS   24000
-#define ACT_ARENA_WORDS     2048
-#define MAX_LIVE_TENSORS    16
+#ifndef DEEPBINDI_MODEL
+#  define DEEPBINDI_MODEL 0   /* default: CNN_1D_v2 */
+#endif
+
+/* Real-weights build: weight pool is unused (weights in .rodata).
+ * A 1-word stub avoids a zero-size array (C99 UB). */
+#if defined(DEEPBINDI_REAL_WEIGHTS)
+#  define WEIGHT_POOL_WORDS   1
+#elif DEEPBINDI_MODEL == 1 || DEEPBINDI_MODEL == 2
+#  define WEIGHT_POOL_WORDS   6000   /* MobileCNN-1D / SE (max ~5489 dummy words) */
+#else
+#  define WEIGHT_POOL_WORDS   24000  /* CNN_1D_v2 baseline (max ~19713 dummy words) */
+#endif
+
+#define ACT_ARENA_WORDS     2048   /* covers all models (max 1803 words for SE) */
+#define MAX_LIVE_TENSORS    16     /* covers all models (max 12 for SE model) */
 
 /* ---- Global pool declarations ----------------------------------------- */
 

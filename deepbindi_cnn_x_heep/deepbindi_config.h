@@ -21,11 +21,17 @@
 
 #include <stdio.h>
 
-/* Logging: always enabled. */
-#define DEEPBINDI_ENABLE_LOGGING
-
-#define DEEPBINDI_PRINTF(...)       printf(__VA_ARGS__)
-#define DEEPBINDI_LOG_ERROR(...)    printf(__VA_ARGS__)
+/* Verbose layer / arena trace.
+ * Define -DDEEPBINDI_TRACE_LAYERS at build time to enable per-layer tensor
+ * shape+checksum prints (nn_runtime.c) and arena usage stats (arena.c).
+ * The final result output in main.c (label, cycles) is always printed. */
+#ifdef DEEPBINDI_TRACE_LAYERS
+#  define DEEPBINDI_PRINTF(...)     printf(__VA_ARGS__)
+#  define DEEPBINDI_LOG_ERROR(...)  printf(__VA_ARGS__)
+#else
+#  define DEEPBINDI_PRINTF(...)     ((void)0)
+#  define DEEPBINDI_LOG_ERROR(...)  ((void)0)
+#endif
 
 /* Fatal: spin forever on bare metal; exit(1) on PC. */
 #ifdef TARGET_PC
