@@ -31,7 +31,17 @@
 
 /* ---- Real weights (optional) --------------------------------------------- */
 
-#if defined(DEEPBINDI_REAL_WEIGHTS) && defined(DEEPBINDI_MODEL)
+#ifndef DEEPBINDI_MODEL
+#  define DEEPBINDI_MODEL 0
+#endif
+
+#if defined(DEEPBINDI_REAL_WEIGHTS) && (DEEPBINDI_MODEL == 1 || DEEPBINDI_MODEL == 2)
+#  define DEEPBINDI_MOBILE_REAL_WEIGHTS 1
+#else
+#  define DEEPBINDI_MOBILE_REAL_WEIGHTS 0
+#endif
+
+#if DEEPBINDI_MOBILE_REAL_WEIGHTS
 #  if DEEPBINDI_MODEL == 1
 #    include "weights_mobile1d.h"
 #  elif DEEPBINDI_MODEL == 2
@@ -54,9 +64,9 @@ static Tensor *make_input_1d(const int32_t *input_data) {
     return input;
 }
 
-/* ---- Dummy-path helpers (compiled away in DEEPBINDI_REAL_WEIGHTS build) --- */
+/* ---- Dummy-path helpers --------------------------------------------------- */
 
-#ifndef DEEPBINDI_REAL_WEIGHTS
+#if !DEEPBINDI_MOBILE_REAL_WEIGHTS
 
 /*
  * apply_dw_bn_relu  --  DWConv + BN + ReLU (dummy weights, seeded).
@@ -130,7 +140,7 @@ static Tensor *apply_fc_threshold(const Tensor *input, int seed) {
     return out;
 }
 
-#endif /* !DEEPBINDI_REAL_WEIGHTS */
+#endif /* !DEEPBINDI_MOBILE_REAL_WEIGHTS */
 
 
 /* ---- run_mobilecnn_1d ----------------------------------------------------- */
@@ -160,14 +170,14 @@ Tensor *run_mobilecnn_1d(const int32_t *input_data) {
     Tensor *dw2_out, *pw2_out, *pool2;
     Tensor *flat, *output;
 
-#ifndef DEEPBINDI_REAL_WEIGHTS
+#if !DEEPBINDI_MOBILE_REAL_WEIGHTS
     weight_arena_reset();
 #endif
     act_arena_reset();
 
     input = make_input_1d(input_data);
 
-#ifdef DEEPBINDI_REAL_WEIGHTS
+#if DEEPBINDI_MOBILE_REAL_WEIGHTS
     /* ============================================================
      * REAL WEIGHTS PATH  (weights_mobile1d.h)
      * =========================================================== */
@@ -248,7 +258,7 @@ Tensor *run_mobilecnn_1d(const int32_t *input_data) {
     tensor_free(pool2);
     output = apply_fc_threshold(flat, 50);
     tensor_free(flat);
-#endif /* DEEPBINDI_REAL_WEIGHTS */
+#endif /* DEEPBINDI_MOBILE_REAL_WEIGHTS */
 
     return output;
 }
@@ -273,14 +283,14 @@ Tensor *run_mobilecnn_se_1d(const int32_t *input_data) {
     Tensor *dw2_out, *pw2_out, *pool2;
     Tensor *flat, *output;
 
-#ifndef DEEPBINDI_REAL_WEIGHTS
+#if !DEEPBINDI_MOBILE_REAL_WEIGHTS
     weight_arena_reset();
 #endif
     act_arena_reset();
 
     input = make_input_1d(input_data);
 
-#ifdef DEEPBINDI_REAL_WEIGHTS
+#if DEEPBINDI_MOBILE_REAL_WEIGHTS
     /* ============================================================
      * REAL WEIGHTS PATH  (weights_mobile_se.h)
      * =========================================================== */
@@ -389,7 +399,7 @@ Tensor *run_mobilecnn_se_1d(const int32_t *input_data) {
     tensor_free(pool2);
     output = apply_fc_threshold(flat, 50);
     tensor_free(flat);
-#endif /* DEEPBINDI_REAL_WEIGHTS */
+#endif /* DEEPBINDI_MOBILE_REAL_WEIGHTS */
 
     return output;
 }
